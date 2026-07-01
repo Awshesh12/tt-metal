@@ -235,6 +235,14 @@ constexpr bool quasar_binary_op_is_quant(ckernel::BinaryOp op)
     return op == ckernel::BinaryOp::QUANT || op == ckernel::BinaryOp::REQUANT || op == ckernel::BinaryOp::DEQUANT;
 }
 
+// Map the shared BinaryOp enum onto the quant kernel's op-templated QuantVariant.
+constexpr ckernel::sfpu::QuantVariant quant_variant_of(ckernel::BinaryOp op)
+{
+    return op == ckernel::BinaryOp::QUANT     ? ckernel::sfpu::QuantVariant::Quant
+           : op == ckernel::BinaryOp::REQUANT ? ckernel::sfpu::QuantVariant::Requant
+                                              : ckernel::sfpu::QuantVariant::Dequant;
+}
+
 /**
  * @brief Run the per-operation init step for a Quasar binary SFPU op.
  *
@@ -259,17 +267,10 @@ void init_binary_sfpu_operation_quasar([[maybe_unused]] std::uint32_t zero_point
     {
         _init_binary_max_min_();
     }
-    else if constexpr (OP == BinaryOp::QUANT)
+    else if constexpr (quasar_binary_op_is_quant(OP))
     {
-        _quant_int32_init_<false /*APPROX*/>(zero_point);
-    }
-    else if constexpr (OP == BinaryOp::REQUANT)
-    {
-        _requant_int32_init_<false /*APPROX*/>(zero_point);
-    }
-    else if constexpr (OP == BinaryOp::DEQUANT)
-    {
-        _dequant_int32_init_<false /*APPROX*/>(zero_point); // caller passes bits of -zero_point
+        // One op-templated quant kernel; DEQUANT's caller passes bits of -zero_point.
+        _quant_family_init_<quant_variant_of(OP)>(zero_point);
     }
     // ADD / GT / LT / LE / GE are stateless — no init.
 }
@@ -332,17 +333,9 @@ void call_binary_sfpu_operation_quasar(
         _llk_math_eltwise_binary_sfpu_params_(
             calculate_sfpu_binary<false /*APPROX*/, BinaryOp::DIV, is_fp32_dest_acc_en, ITERATIONS>, src0_tile, src1_tile, dst_tile);
     }
-    else if constexpr (OP == BinaryOp::QUANT)
+    else if constexpr (quasar_binary_op_is_quant(OP))
     {
-        _llk_math_eltwise_binary_sfpu_params_(_quant_int32_<false, ITERATIONS>, in0_off, in1_off, out_off);
-    }
-    else if constexpr (OP == BinaryOp::REQUANT)
-    {
-        _llk_math_eltwise_binary_sfpu_params_(_requant_int32_<false, ITERATIONS>, in0_off, in1_off, out_off);
-    }
-    else if constexpr (OP == BinaryOp::DEQUANT)
-    {
-        _llk_math_eltwise_binary_sfpu_params_(_dequant_int32_<false, ITERATIONS>, in0_off, in1_off, out_off);
+        _llk_math_eltwise_binary_sfpu_params_(_quant_family_<quant_variant_of(OP), ITERATIONS>, in0_off, in1_off, out_off);
     }
     else if constexpr (quasar_binary_op_is_max_min(OP))
     {

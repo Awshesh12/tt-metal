@@ -66,6 +66,28 @@ _CPP_SOURCE = "sources/quasar/eltwise_binary_sfpu_quasar_test.cpp"
 _TILE_INDEX_VARIANTS = [(0, 1, 0), (2, 3, 0)]
 
 
+def _stage_binary_operands(op0_flat, op1_flat, tile_indices, dtype):
+    """Lay two binary operands into a TILE_CNT-tile buffer_A so buffer_A[i] maps
+    to Dest[i]: op0 at tile src0_idx, op1 at tile src1_idx, gaps zero-filled.
+    The kernel writes the result to Dest[dst_idx], which may alias an operand
+    tile (e.g. (0, 1, 0)) or be disjoint (e.g. (2, 3, 0)). Shared by the max/min
+    (float/int) and quant (raw-int32) families."""
+    src0_idx, src1_idx, dst_idx = tile_indices
+    tile_cnt = max(src0_idx, src1_idx, dst_idx) + 1
+
+    def _pad_to_tile(flat):
+        if len(flat) < MAX_TILE_ELEMENTS:
+            return torch.cat(
+                [flat, torch.zeros(MAX_TILE_ELEMENTS - len(flat), dtype=dtype)]
+            )
+        return flat
+
+    tiles = [torch.zeros(MAX_TILE_ELEMENTS, dtype=dtype) for _ in range(tile_cnt)]
+    tiles[src0_idx] = _pad_to_tile(op0_flat.flatten())
+    tiles[src1_idx] = _pad_to_tile(op1_flat.flatten())
+    return torch.cat(tiles), tile_cnt
+
+
 def _get_valid_implied_math_formats(fmt: FormatConfig):
     """Valid IMPLIED_MATH_FORMAT settings for a format, shared by every binary
     family: MX formats run only with ImpliedMathFormat.Yes; all others run both."""
@@ -416,27 +438,6 @@ def _generate_max_min_combinations(
     return combinations
 
 
-def _stage_max_min_operands(op0_flat, op1_flat, tile_indices, dtype):
-    """Lay the two max/min operands into a TILE_CNT-tile buffer_A so buffer_A[i]
-    maps to Dest[i]: op0 at tile src0_idx, op1 at tile src1_idx, gaps zero-filled.
-    The kernel writes the result to Dest[dst_idx], which may alias an operand
-    tile (e.g. (0, 1, 0)) or be disjoint (e.g. (2, 3, 0))."""
-    src0_idx, src1_idx, dst_idx = tile_indices
-    tile_cnt = max(src0_idx, src1_idx, dst_idx) + 1
-
-    def _pad_to_tile(flat):
-        if len(flat) < MAX_TILE_ELEMENTS:
-            return torch.cat(
-                [flat, torch.zeros(MAX_TILE_ELEMENTS - len(flat), dtype=dtype)]
-            )
-        return flat
-
-    tiles = [torch.zeros(MAX_TILE_ELEMENTS, dtype=dtype) for _ in range(tile_cnt)]
-    tiles[src0_idx] = _pad_to_tile(op0_flat)
-    tiles[src1_idx] = _pad_to_tile(op1_flat)
-    return torch.cat(tiles), tile_cnt
-
-
 def _run_max_min(
     formats,
     dest_acc,
@@ -474,8 +475,8 @@ def _run_max_min(
             else torch.minimum(in0_int, in1_int)
         )
         golden_tensor = golden_int.to(torch.float32)
-        buffer_A_combined, tile_cnt = _stage_max_min_operands(
-            in0_int.flatten(), in1_int.flatten(), tile_indices, torch.int32
+        buffer_A_combined, tile_cnt = _stage_binary_operands(
+            in0_int, in1_int, tile_indices, torch.int32
         )
         buffer_B_dummy = in1_int
         disable_format_inference = False
@@ -504,8 +505,8 @@ def _run_max_min(
             golden_tensor = quantize_mx_stimuli(
                 golden_tensor.flatten(), formats.output_format, num_faces
             ).reshape(golden_tensor.shape)
-        buffer_A_combined, tile_cnt = _stage_max_min_operands(
-            in0.flatten(), in1.flatten(), tile_indices, in0.dtype
+        buffer_A_combined, tile_cnt = _stage_binary_operands(
+            in0, in1, tile_indices, in0.dtype
         )
         buffer_B_dummy = in1
         disable_format_inference = formats.input_format.is_mx_format()
@@ -658,26 +659,6 @@ def _fp32_bits_as_int32(t: torch.Tensor) -> torch.Tensor:
     return t.to(torch.float32).contiguous().view(torch.int32)
 
 
-def _stage_quant_operands(a_int32, b_int32, tile_indices):
-    """Lay raw-int32 operand A at tile src0_idx and the raw-int32 scale B at tile
-    src1_idx in a TILE_CNT-tile buffer; gaps zero-filled. Mirrors
-    _stage_max_min_operands but for the two quant operands."""
-    src0_idx, src1_idx, dst_idx = tile_indices
-    tile_cnt = max(src0_idx, src1_idx, dst_idx) + 1
-
-    def _pad(flat):
-        if len(flat) < MAX_TILE_ELEMENTS:
-            return torch.cat(
-                [flat, torch.zeros(MAX_TILE_ELEMENTS - len(flat), dtype=torch.int32)]
-            )
-        return flat
-
-    tiles = [torch.zeros(MAX_TILE_ELEMENTS, dtype=torch.int32) for _ in range(tile_cnt)]
-    tiles[src0_idx] = _pad(a_int32.flatten())
-    tiles[src1_idx] = _pad(b_int32.flatten())
-    return torch.cat(tiles), tile_cnt
-
-
 _QUANT_OPS = ["QUANT", "REQUANT", "DEQUANT"]
 
 
@@ -712,7 +693,9 @@ def _run_quant(binary_op, tile_indices):
 
     b_staged = _fp32_bits_as_int32(scale)
 
-    buffer_A, tile_cnt = _stage_quant_operands(a_staged, b_staged, tile_indices)
+    buffer_A, tile_cnt = _stage_binary_operands(
+        a_staged, b_staged, tile_indices, torch.int32
+    )
 
     # ---- golden ----
     if is_dequant:
