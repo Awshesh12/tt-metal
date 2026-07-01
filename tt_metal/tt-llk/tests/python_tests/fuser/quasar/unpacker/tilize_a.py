@@ -53,17 +53,13 @@ class UnpackerTilizeA(Unpacker):
     ) -> str:
         full_ct_dim = compute_unit.src_a.tile_count_x
         buf_desc_id = compute_unit.src_a.buf_desc_id
-        face_r_dim = compute_unit.src_a.tile_shape.face_r_dim
-        face_c_dim = compute_unit.src_a.tile_shape.face_c_dim
-        num_faces_r = compute_unit.src_a.tile_shape.num_faces_r_dim
-        num_faces_c = compute_unit.src_a.tile_shape.num_faces_c_dim
-        en_32bit_dest = "true" if config.dest_acc.value else "false"
+        en_32bit_dest = config.dest_acc.cpp_enum_value
+        tensor_shape = compute_unit.src_a.tile_shape.cpp_value
         block_ct_dim = 1
 
         return (
             f"_llk_unpack_tilize_init_<p_unpacr::UNP_A, {en_32bit_dest}>"
-            f"({buf_desc_id}, {full_ct_dim}, {block_ct_dim}, "
-            f"ckernel::TensorShape{{{face_r_dim}, {face_c_dim}, {num_faces_r}, {num_faces_c}}});\n"
+            f"({buf_desc_id}, {full_ct_dim}, {block_ct_dim}, {tensor_shape});\n"
         )
 
     def unpack(
