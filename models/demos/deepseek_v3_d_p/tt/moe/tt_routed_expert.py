@@ -24,6 +24,7 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.utility_functions import is_blackhole
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import ExpertMapping
+from models.demos.deepseek_v3_d_p.tt.tt_ccl import get_tt_ccl
 
 COMPUTE_KERNEL_CONFIG_LOFI = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.LoFi,
@@ -203,6 +204,7 @@ class TtRoutedExpert(LightweightModule):
         weight_cache_path: Optional[Path] = None,
         cache_name_prefix: Optional[str] = None,
         subdevice_id=None,
+        global_semaphore: GlobalSemaphore | None = None,
     ):
         """
         Initialize TtRoutedExpert module.
@@ -243,6 +245,7 @@ class TtRoutedExpert(LightweightModule):
         self.cache_name_prefix = cache_name_prefix
         self.global_expert_idx_table = global_expert_idx_table
         self.subdevice_id = subdevice_id
+        self.global_semaphore = global_semaphore
 
         total_experts = self.num_devices * experts_per_chip
         logger.debug(f"Initializing TtRoutedExpert with experts_per_chip={experts_per_chip}")
@@ -311,17 +314,13 @@ class TtRoutedExpert(LightweightModule):
         assert result is not None, "Expected weight tensors to be returned when device is provided"
         self.gate_projs, self.up_projs, self.down_projs = result
 
-        # Due to determinism issue: pre-allocate ONE long-lived buffer that the unified MoE op
-        # reuses as the per-expert extract output. Holding it on the module keeps the extracted-tokens
-        # DRAM allocation alive and stable across forward() call.
+        # Due to determinism issue: reuse ONE long-lived buffer as the per-expert extract output for
+        # the unified MoE op, kept alive at a stable address across every forward() call.
         #
-        # Note: This should not be needed once the routed expert kernel is fully unified (Issue #41106)
-        self.extracted_tokens = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([1, 1, self.max_tokens, self.emb_dim]),
-            self.activations_dtype,
-            ttnn.TILE_LAYOUT,
-            self.mesh_device,
-            ttnn.DRAM_MEMORY_CONFIG,
+        # Note: This should not be needed once the routed expert kernel is fully unified (Issue #41106).
+        # When that lands, remove get_shared_extracted_tokens from tt_ccl and let the op own its output.
+        self.extracted_tokens = get_tt_ccl(mesh_device).get_shared_extracted_tokens(
+            self.max_tokens, self.emb_dim, self.activations_dtype
         )
 
     @staticmethod
@@ -391,7 +390,6 @@ class TtRoutedExpert(LightweightModule):
         dispatched_buffer: ttnn.Tensor,
         expert_token_counts: ttnn.Tensor,
         expert_region_offsets: ttnn.Tensor,
-        global_semaphore: GlobalSemaphore | None = None,
     ) -> ttnn.Tensor:
         """
         On Blackhole, delegates the per-local-expert work to the
@@ -411,9 +409,6 @@ class TtRoutedExpert(LightweightModule):
             expert_region_offsets: Expert region start offsets per expert
                 (shared across source devices in a dispatch group). Produced by
                 offset_cumsum. Shape per device: (1, num_routed_experts).
-            global_semaphore: Optional global semaphore used to overlap the routed expert with
-                the combine: each per-expert FFN increments it once its output is written, and
-                the combine waits on it before consuming that expert's region.
 
         Returns:
             expert_outputs: Expert output tensor, same shape as dispatched_buffer
@@ -437,7 +432,7 @@ class TtRoutedExpert(LightweightModule):
                 self.down_projs,
                 max_dispatched_tokens_per_expert=self.max_tokens,
                 compute_kernel_config=self.compute_kernel_config,
-                global_semaphore=global_semaphore,
+                global_semaphore=self.global_semaphore,
                 subdevice_id=self.subdevice_id,
                 extracted_tokens=self.extracted_tokens,
             )

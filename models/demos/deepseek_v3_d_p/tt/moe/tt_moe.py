@@ -332,7 +332,6 @@ class TtMoe(LightweightModule):
 
             # Global semaphore is only needed for overlapping the routed expert with the combine.
             # See TT_CCL.get_routed_expert_global_semaphore.
-            self.routed_expert_global_semaphore = None
             if overlap_routed_expert_with_combine:
                 self.routed_expert_global_semaphore = self.tt_ccl.get_routed_expert_global_semaphore(dm_cores)
 
@@ -401,6 +400,7 @@ class TtMoe(LightweightModule):
             weight_cache_path=weight_cache_path,
             cache_name_prefix=f"layer_{layer_idx}.routed_expert",
             subdevice_id=self.compute_sd_id if self.overlap_routed_expert_with_combine else None,
+            global_semaphore=self.routed_expert_global_semaphore if self.overlap_routed_expert_with_combine else None,
         )
 
         # Initialize shared expert (col axis: axis 1)
@@ -634,7 +634,6 @@ class TtMoe(LightweightModule):
             dispatched_buffer_tiled,
             tt_expert_token_counts,
             tt_expert_region_offsets,
-            global_semaphore=self.routed_expert_global_semaphore,
         )
         logger.debug(f"[TtMoe.forward] expert_outputs shape: {expert_outputs.shape} {expert_outputs.dtype=}")
 

@@ -121,6 +121,13 @@ class TT_CCL:
         # leaking one RS input per layer. See set_shared_rs_input_keepalive / TtSharedExpert.forward.
         self.shared_rs_input_keepalive = None
 
+        # Long-lived per-expert extract-output buffer for the unified routed-expert MoE op. Held here
+        # rather than on each per-layer TtRoutedExpert — a per-instance buffer would never be released
+        # leaking one extract buffer per layer.
+        # NOTE: this workaround exists only for the routed-expert determinism issue; remove it from
+        # tt_ccl (and let the op own its output) once the kernel is fully unified (Issue #41106).
+        self.shared_extracted_tokens = None
+
         # Persistent ring-attention buffers shared by every layer's MLA, keyed by their shape
         # signature. One set for the whole model. See get_mla_ring_attention_buffers.
         self.mla_ring_attention_buffers: dict[tuple, dict] = {}
@@ -247,6 +254,26 @@ class TT_CCL:
         tt_ccl (one instance for the whole model), NOT on the per-layer TtSharedExpert object — the
         latter would pin one RS input per layer for the model's lifetime, leaking DRAM every layer."""
         self.shared_rs_input_keepalive = input_tensor
+
+    def get_shared_extracted_tokens(self, max_tokens: int, emb_dim: int, dtype):
+        """Lazily allocate (once per mesh) and return the shared per-expert extract-output buffer used
+        by the unified routed-expert MoE op. Pre-allocating ONE long-lived, stable-address DRAM buffer
+        keeps the extracted-tokens allocation fixed across every forward (required for determinism).
+        A single buffer for the whole model is safe: all MoE layers share the shape/dtype and run
+        sequentially. It lives here — not on each per-layer TtRoutedExpert — because a per-instance
+        buffer is never released (every layer object outlives the model), leaking one buffer per layer.
+
+        NOTE: this belongs on tt_ccl only as a workaround for the routed-expert determinism issue;
+        remove it (and let the op own its output) once the kernel is fully unified (Issue #41106)."""
+        if self.shared_extracted_tokens is None:
+            self.shared_extracted_tokens = ttnn.allocate_tensor_on_device(
+                ttnn.Shape([1, 1, max_tokens, emb_dim]),
+                dtype,
+                ttnn.TILE_LAYOUT,
+                self.mesh_device,
+                ttnn.DRAM_MEMORY_CONFIG,
+            )
+        return self.shared_extracted_tokens
 
     def get_routed_expert_global_semaphore(self, cores):
         """Lazily create (once per mesh) and return the global semaphore used to overlap the routed
