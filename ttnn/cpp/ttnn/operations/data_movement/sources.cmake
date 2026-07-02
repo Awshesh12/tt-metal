@@ -64,10 +64,6 @@ set(TTNN_OP_DATA_MOVEMENT_SRCS
     pad/device/pad_tile_multicore_program_factory.cpp
     pad/device/pad_tile_program_factory.cpp
     pad/pad.cpp
-    permute/device/permute_device_operation.cpp
-    permute/device/permute_rm_program_factory.cpp
-    permute/device/permute_tiled_program_factory.cpp
-    permute/permute.cpp
     repeat/device/repeat_program_factory_last_dim.cpp
     repeat/device/repeat_program_factory_higher_dim.cpp
     repeat/device/repeat_device_operation.cpp
@@ -158,7 +154,6 @@ set(TTNN_OP_DATA_MOVEMENT_API_HEADERS
     fill_rm/device/fill_rm_device_operation.hpp
     move/device/move_device_operation.hpp
     pad/pad.hpp
-    permute/permute.hpp
     repeat/repeat.hpp
     reshape_view/reshape.hpp
     reshape_view/reshape_common.hpp
