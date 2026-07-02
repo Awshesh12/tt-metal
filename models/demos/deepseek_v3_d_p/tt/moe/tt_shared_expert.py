@@ -267,11 +267,6 @@ class TtSharedExpert(LightweightModule):
         self.compute_kernel_config = compute_kernel_config
         self.subdevice_id = subdevice_id
         self.weight_cache_path = weight_cache_path
-        # Hold the reduce-scatter INPUT alive until the next forward so it is not freed while the
-        # async reduce_scatter is still reading it and reused by the concurrent dispatch op (the
-        # catastrophic use-after-free). See forward().
-        self._rs_input_keepalive = None
-        # Shared per-mesh CCL handle. Drives reduce_scatter_minimal_async and owns the shared,
         # stable-address reduce_scatter INTERMEDIATE buffer (one per mesh, reused by all layers'
         # shared experts) — see forward() and TT_CCL.get_shared_rs_intermediate.
         self.tt_ccl = get_tt_ccl(mesh_device)
@@ -506,7 +501,8 @@ class TtSharedExpert(LightweightModule):
             )
             # Keep the (fresh-per-iter) RS input alive until the next forward so the concurrent
             # dispatch cannot reuse its slot mid-flight. (The intermediate is kept alive by the cache.)
-            self._rs_input_keepalive = output_full
+            # Stored on the shared tt_ccl (one slot for the whole model) rather than on self.
+            self.tt_ccl.set_shared_rs_input_keepalive(output_full)
         else:
             output = output_full
         logger.debug(f"After shared_expert_ffn: {output.shape}")
