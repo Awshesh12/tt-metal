@@ -68,7 +68,7 @@ sfpi_inline sfpi::vFloat softplus_exp_negative(sfpi::vFloat x) {
 #endif
 
     // Scale by 2^k via exponent manipulation
-    sfpi::vInt p_exp = sfpi::exexp(poly, sfpi::ExponentMode::NoDebias);
+    sfpi::vInt p_exp = sfpi::exexp(poly, sfpi::ExponentMode::Biased);
     sfpi::vInt new_exp = p_exp + k_int;
 
     // FTZ: if exponent underflows, result is 0
@@ -118,9 +118,7 @@ inline void calculate_softplus_body(const float beta, const float beta_reciproca
         // Reconstruct softplus(t):
         //   t >= 0: softplus(t) = t + f(t) = max(0,t) + residual
         //   t < 0:  softplus(t) = f(|t|) = 0 + residual
-        // Branch-free: vec_min_max clamps t to max(0,t), saving 1 instruction vs v_if
-        sfpi::vFloat zero_threshold = 0.0f;
-        sfpi::vec_min_max(zero_threshold, t);
+        t = sfpi::max(t, 0.0f);
         sfpi::vFloat sp = t + residual;
 
         // Round-to-nearest for bf16 destination (SFPSTORE defaults to truncation)

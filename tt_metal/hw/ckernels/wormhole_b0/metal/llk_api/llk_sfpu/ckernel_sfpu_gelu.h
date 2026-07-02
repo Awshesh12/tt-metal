@@ -88,7 +88,7 @@ sfpi_inline sfpi::vFloat x_times_exp_negative_tail(sfpi::vFloat x, sfpi::vFloat 
     sfpi::vFloat x_poly = x * poly;  // x * poly ≈ -9 to -13 (safe range)
 
     // Step 5: Exponent bit manipulation on the FUSED result
-    sfpi::vInt xpoly_exp = sfpi::exexp(x_poly, sfpi::ExponentMode::NoDebias);  // Extract exponent of x*poly
+    sfpi::vInt xpoly_exp = sfpi::exexp(x_poly, sfpi::ExponentMode::Biased);  // Extract exponent of x*poly
     sfpi::vInt new_exp = xpoly_exp + k_int;               // Shift by 2^k
 
     // Step 6: FTZ check on FINAL result (x * exp(t)), not intermediate exp(t)
@@ -156,7 +156,7 @@ sfpi_inline sfpi::vFloat calculate_gelu_piecewise(sfpi::vFloat x) {
         sfpi::vFloat xlog2 = x2 * NEG_HALF_ONE_LN2 + 127.0f;
 
         sfpi::vInt z = _float_to_int32_for_exp_21f_(xlog2);
-        sfpi::vInt exponential_part = sfpi::exexp(sfpi::as<sfpi::vFloat>(z), sfpi::ExponentMode::NoDebias);
+        sfpi::vInt exponential_part = sfpi::exexp(sfpi::as<sfpi::vFloat>(z), sfpi::ExponentMode::Biased);
         sfpi::vMag fractional_part = sfpi::exman(sfpi::as<sfpi::vFloat>(z));
 
         sfpi::vFloat frac = sfpi::convert<sfpi::vFloat>(fractional_part, sfpi::RoundMode::Nearest);
@@ -312,17 +312,13 @@ inline void calculate_gelu() {
             sfpi::vFloat result = sfpi::vConst0;  // default 0 for x <= GELU_SAT
             v_if(x > GELU_SAT) {
                 sfpi::vFloat scaled = x * INV_SQRT2;
-                sfpi::vFloat threshold = 10.0f;
-                sfpi::vec_min_max(scaled, threshold);
+                scaled = sfpi::min(scaled, 10.0f);
                 sfpi::vFloat x2 = scaled * scaled;
                 sfpi::vFloat erf_n, erf_d;
                 piecewise_rational_eval_parity_numer_denom<16, 16>(
                     GELU_ERF_NUM, GELU_ERF_DEN, scaled, x2, erf_n, erf_d);
                 sfpi::vFloat erf_val = erf_n * sfpu_reciprocal<false>(erf_d);
-                sfpi::vFloat neg_one = sfpi::vConstNeg1;
-                sfpi::vFloat pos_one = sfpi::vConst1;
-                sfpi::vec_min_max(neg_one, erf_val);
-                sfpi::vec_min_max(erf_val, pos_one);
+                erf_val = sfpi::clamp(erf_val, -1.0f, 1.0f);
                 result = x * (0.5f + 0.5f * erf_val);
                 // Stuck-erff guard: when rational rounds erf to -1.0 inside computation zone,
                 // glibc/torch overestimates erfc → first stuck level = x * 2^-25.

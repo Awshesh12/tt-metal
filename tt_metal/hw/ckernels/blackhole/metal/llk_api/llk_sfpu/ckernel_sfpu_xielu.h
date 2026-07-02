@@ -21,8 +21,7 @@ sfpi_inline sfpi::vFloat _sfpu_neg_exp_f32_(sfpi::vFloat val) {
     sfpi::vFloat z = val * sfpi::vConstFloatPrgm0;
 
     // Clamp z to -126.5: exp(x) underflows to 0 for large negative x
-    sfpi::vFloat underflow_bound = UNDERFLOW_THRESHOLD;
-    sfpi::vec_min_max(underflow_bound, z);
+    z = sfpi::max(z, UNDERFLOW_THRESHOLD);
 
     // Round z to nearest integer using round-to-nearest
     sfpi::vInt k_int;
@@ -77,8 +76,8 @@ sfpi_inline sfpi::vFloat _sfpu_neg_exp_f32_(sfpi::vFloat val) {
     // Step 4: Scale by 2^k using exponent manipulation
     // ldexp(p, k_int) = p * 2^k
     // We do this by adding k_int to the exponent of p
-    // Get the current exponent of p (without bias)
-    sfpi::vInt p_exp = sfpi::exexp(p, sfpi::ExponentMode::NoDebias);
+    // Get the biased exponent of p
+    sfpi::vInt p_exp = sfpi::exexp(p, sfpi::ExponentMode::Biased);
     // Add k_int to get the new exponent
     sfpi::vInt new_exp = p_exp + k_int;
 
