@@ -243,6 +243,97 @@ def test_relu(device, h, w, layout):
     run_unary_test(device, h, w, ttnn.relu, layout=layout, ulp=0)
 
 
+# Value ranges spanning uint32 up to 2**31-1. Values are stored as int32 (matching
+# test_binary_uint32.py), which is also the range the signed-max integer relu kernel handles
+# exactly; uint32 >= 2**31 is a known limitation of that kernel and is excluded here.
+UINT32_RELU_RANGES = [(0, 1000), (1e3, 1e6), (1e6, 1e8), (1e9, 2147483647)]
+
+
+def create_full_range_int_tensor(input_shape, value_ranges):
+    num_elements = torch.prod(torch.tensor(input_shape)).item()
+    per_range = num_elements // len(value_ranges)
+    remainder = num_elements % len(value_ranges)
+
+    segments = []
+    for i, (low, high) in enumerate(value_ranges):
+        n = per_range + (1 if i < remainder else 0)
+        segments.append(torch.linspace(low, high, steps=n, dtype=torch.int32))
+    return torch.cat(segments).reshape(input_shape)
+
+
+@pytest.mark.parametrize("input_shapes", [torch.Size([1, 2, 32, 128])])
+def test_relu_uint32_full_range(device, input_shapes):
+    """#48763 Bug 2: uint32 relu must return the input unchanged (relu of a non-negative value is
+    the identity). Previously every positive uint32 came back as 0 on Wormhole."""
+    torch_input_tensor = create_full_range_int_tensor(input_shapes, UINT32_RELU_RANGES)
+
+    golden_function = ttnn.get_golden_function(ttnn.relu)
+    torch_output_tensor = golden_function(torch_input_tensor, device=device)
+
+    input_tensor = ttnn.from_torch(
+        torch_input_tensor,
+        dtype=ttnn.uint32,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    output_tensor = ttnn.to_torch(ttnn.relu(input_tensor), dtype=torch.int32)
+
+    assert torch.equal(output_tensor, torch_output_tensor)
+
+
+@pytest.mark.parametrize("input_shapes", [torch.Size([1, 2, 32, 128])])
+def test_relu_uint8_full_range(device, input_shapes):
+    """#48763 Bug 2: uint8 relu must return the input unchanged. Covers every uint8 value 0..255."""
+    num_elements = torch.prod(torch.tensor(input_shapes)).item()
+    reps = (num_elements + 255) // 256
+    torch_input_tensor = torch.arange(256, dtype=torch.uint8).repeat(reps)[:num_elements].reshape(input_shapes)
+
+    golden_function = ttnn.get_golden_function(ttnn.relu)
+    torch_output_tensor = golden_function(torch_input_tensor, device=device)
+
+    input_tensor = ttnn.from_torch(
+        torch_input_tensor,
+        dtype=ttnn.uint8,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    output_tensor = ttnn.to_torch(ttnn.relu(input_tensor), dtype=torch.uint8)
+
+    assert torch.equal(output_tensor, torch_output_tensor)
+
+
+def test_relu_uint32_issue_edge_cases(device):
+    """Exact values reported in #48763 Bug 2 for the uint32 relu family (relu / unary_chain / reglu)."""
+    # relu(41)->41 and unary_chain([RELU])(35)->35, plus boundary values.
+    values = [0, 1, 35, 41, 600, 2147483647]
+    torch_input_tensor = torch.tensor([values], dtype=torch.int32)
+
+    golden_function = ttnn.get_golden_function(ttnn.relu)
+    torch_output_tensor = golden_function(torch_input_tensor, device=device)
+
+    input_tensor = ttnn.from_torch(torch_input_tensor, dtype=ttnn.uint32, device=device, layout=ttnn.TILE_LAYOUT)
+
+    relu_out = ttnn.to_torch(ttnn.relu(input_tensor), dtype=torch.int32)
+    assert torch.equal(relu_out, torch_output_tensor)
+
+    chain_out = ttnn.to_torch(
+        ttnn.unary_chain(input_tensor, [ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU)]), dtype=torch.int32
+    )
+    assert torch.equal(chain_out, torch_output_tensor)
+
+    # reglu(gate=600)->600: reglu relu-gates the second half of the last dim then multiplies by the
+    # first half, so multiplier=1 * relu(600) must return 600.
+    multiplier = torch.ones((1, 1, 32, 32), dtype=torch.int32)
+    gate = torch.full((1, 1, 32, 32), 600, dtype=torch.int32)
+    reglu_input = ttnn.from_torch(
+        torch.cat([multiplier, gate], dim=-1), dtype=ttnn.uint32, device=device, layout=ttnn.TILE_LAYOUT
+    )
+    reglu_out = ttnn.to_torch(ttnn.reglu(reglu_input, -1), dtype=torch.int32)
+    assert torch.equal(reglu_out, gate)
+
+
 @pytest.mark.parametrize("layout", [ttnn.TILE_LAYOUT, ttnn.ROW_MAJOR_LAYOUT])
 @pytest.mark.parametrize("h", [64])
 @pytest.mark.parametrize("w", [128])

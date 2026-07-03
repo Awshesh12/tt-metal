@@ -674,10 +674,10 @@ std::pair<std::string, std::string> get_op_init_and_func_default(
         case UnaryOpType::RELU:
             TT_FATAL(
                 input_dtype.has_value(), "Missing input dtype: Expected a valid input dtype, but none was provided.");
-            if (input_dtype == DataType::INT32) {
+            if (input_dtype == DataType::INT32 || input_dtype == DataType::UINT32 || input_dtype == DataType::UINT8) {
                 return {"relu_tile_init();", fmt::format("relu_tile_int32({});", idst)};
             }
-            return {"relu_tile_init();", fmt::format("        relu_tile({});", idst)};
+            return {"relu_tile_init();", fmt::format("relu_tile({});", idst)};
 
         case UnaryOpType::SIGNBIT:
             TT_FATAL(
