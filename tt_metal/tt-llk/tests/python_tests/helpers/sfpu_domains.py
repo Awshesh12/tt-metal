@@ -151,6 +151,10 @@ _OP_DOMAIN_REGISTRY: Dict[
     MathOperation.Elu: OperandSpecs(
         spec_A=StimuliSpec(distribution=DistributionKind.UNIFORM, low=-5.0, high=5.0)
     ),
+    # erfinv: domain |x| < 1; stay just inside +-1 to avoid the +-inf endpoints
+    MathOperation.Erfinv: OperandSpecs(
+        spec_A=StimuliSpec(distribution=DistributionKind.UNIFORM, low=-0.99, high=0.99)
+    ),
     # exp: format-specific overflow threshold
     MathOperation.Exp: _exp_spec,
     # exp2: format-specific overflow threshold
@@ -446,6 +450,9 @@ _SFPU_UNDEFINED_RANGES: Dict[
         Operand.A: [(-float("inf"), -1.0 + 1e-6), (1.0 - 1e-6, float("inf"))]
     },
     MathOperation.Log1p: {Operand.A: [(-float("inf"), -1.0 + 1e-6)]},
+    MathOperation.Erfinv: {
+        Operand.A: [(-float("inf"), -1.0 + 1e-6), (1.0 - 1e-6, float("inf"))]
+    },
     MathOperation.Rsqrt: {Operand.A: [(-float("inf"), 1e-6)]},
     MathOperation.Acosh: {Operand.A: [(-float("inf"), 1.0)]},
     # ── Binary: per-operand holes ────────────────────────────────────────────

@@ -27,19 +27,22 @@ sfpi_inline sfpi::vFloat calculate_erfinv_body(sfpi::vFloat x) {
 
     // Paper sets a constant a = 0.147.
     // This constant is used to compute two constant expressions:
-    constexpr float TwoPiA = -4.330746750799873f;   // -2 / (pi * a)
+    constexpr float TwoPiA = -4.330746750799873f;  // -2 / (pi * a)
     constexpr float OneDivA = 6.802721088435375f;  // 1/a
 
     // tmp = -2 / (pi * a) - log(1 - x^2)/2
     sfpi::vFloat tmp = TwoPiA + -0.5f * log_value;
 
     // calculated_value = temp + sqrt( temp^2 - log_value / a)
+    // The Winitzki approximation itself carries ~1e-3 relative error, so a single
+    // Newton step in the sqrt (~1.7e-3) is well within the algorithm's own error
+    // budget; the second NR step was redundant here (2->1 iterations).
     sfpi::vFloat calculated_value = tmp * tmp - log_value * OneDivA;
-    sfpi::vFloat intermediate_result = sfpu_sqrt_custom<false>(calculated_value);
+    sfpi::vFloat intermediate_result = sfpu_sqrt_custom<false, 1>(calculated_value);
     calculated_value = tmp + intermediate_result;
 
     // result = sqrt(calculated_value)
-    sfpi::vFloat result = sfpu_sqrt_custom<false>(calculated_value);
+    sfpi::vFloat result = sfpu_sqrt_custom<false, 1>(calculated_value);
 
     return result;
 }
