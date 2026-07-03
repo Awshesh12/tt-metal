@@ -330,8 +330,9 @@ models:
     wh_llmbox_perf: 1290
     wh_galaxy: 345
     wh_galaxy_perf: 150
-    # 470 = 395 (existing Galaxy DeepSeek Prefill stages) + 60 (new Chunked Kimi 25k) + 15 headroom.
-    bh_galaxy: 470
+    # 720 = 455 (existing Galaxy DeepSeek Prefill stages incl. kimi_chunked 60 min)
+    #       + 240 (kimi_cache_gen, 4h budget for initial cache generation) + 25 headroom.
+    bh_galaxy: 720
     wh_n150: 500
     wh_n150_civ2: 300
     wh_n300: 600

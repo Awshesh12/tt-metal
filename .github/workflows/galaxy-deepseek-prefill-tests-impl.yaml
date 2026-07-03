@@ -172,6 +172,95 @@ jobs:
       - uses: tenstorrent/tt-metal/.github/actions/cleanup@main
         if: always()
 
+  kimi-generate-cache:
+    # Dedicated job for the kimi_cache_gen test entry.  Unlike the regular matrix job
+    # which mounts /mnt/MLPerf read-only, this job mounts it read-write so the conftest
+    # can write the 61-layer Kimi TTNN weight cache to persistent storage.
+    # Only activates when test-type is 'all' or explicitly includes 'kimi_cache_gen'.
+    needs: load-test-matrix
+    if: ${{ inputs.test-type == 'all' || contains(inputs.test-type, 'kimi_cache_gen') }}
+    name: "(Galaxy) DeepSeek Prefill - Kimi Cache Generation"
+    runs-on:
+      - arch-blackhole
+      - pipeline-functional
+      - topology-6u
+      - in-service
+    container:
+      image: ${{ inputs.docker-image || 'docker-image-unresolved!' }}
+      env:
+        TT_METAL_HOME: /work
+        PYTHONPATH: /work
+        LD_LIBRARY_PATH: /work/build/lib
+        LOGURU_LEVEL: INFO
+      volumes:
+        - ${{ github.workspace }}/docker-job:/work
+        - /dev/hugepages-1G:/dev/hugepages-1G
+        - /mnt/MLPerf:/mnt/MLPerf
+      options: "--device /dev/tenstorrent"
+    defaults:
+      run:
+        shell: bash
+        working-directory: /work
+    steps:
+      - name: 🧬 Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        timeout-minutes: 20
+        with:
+          submodules: recursive
+          path: docker-job
+      - name: Mark repository as safe directory
+        run: |
+          git config --global --add safe.directory $GITHUB_WORKSPACE
+      - name: ⬇️  Setup Job
+        uses: ./docker-job/.github/actions/setup-job
+        timeout-minutes: 10
+        with:
+          build-artifact-name: ${{ inputs.build-artifact-name }}
+          wheel-artifact-name: ${{ inputs.wheel-artifact-name }}
+      - name: (Galaxy) DeepSeek Prefill - Kimi Cache Generation
+        timeout-minutes: 240
+        uses: ./docker-job/.github/actions/run-with-log
+        with:
+          log-file: generated/test_logs/kimi_cache_gen.log
+          run: |
+            export MESH_DEVICE=TG
+            export KIMI_K2_6_HF_MODEL=/mnt/MLPerf/huggingface/hub/Kimi-K2.6-dequantized
+            # TT_KIMI_PREFILL_TTNN_CACHE intentionally NOT set; the conftest writes the
+            # 61-layer cache to ${KIMI_K2_6_HF_MODEL}/tensor_cache_bh_32dev/8x4 on the
+            # read-write /mnt/MLPerf mount provided by this job.
+            pytest "models/demos/deepseek_v3_d_p/tests/test_prefill_transformer.py::test_kimi_prefill_transformer" \
+              -k "mesh-8x4 and 61_layers and e384_device and pretrained and random and 5k and iter1 and smoke and non_balanced and right_pad and no_determinism" \
+              -xvs
+            echo "::notice::Kimi TTNN cache written to: ${KIMI_K2_6_HF_MODEL}/tensor_cache_bh_32dev/8x4"
+            echo "For kimi_chunked verification, leave TT_KIMI_PREFILL_TTNN_CACHE unset (conftest auto-detects the path)."
+      - uses: tenstorrent/tt-metal/.github/actions/slack-report@main
+        if: ${{ failure() }}
+        with:
+          slack_webhook_url: ${{ secrets.SLACK_METAL_INFRA_PIPELINE_STATUS_ALERT }}
+          owner: U08RL15T4N8
+      - name: 🤖 AI job summary
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/job@main
+        with:
+          config: |
+            {
+              "model": "${{ vars.AI_SUMMARY_MODEL }}",
+              "workspace": "$GITHUB_WORKSPACE/docker-job",
+              "input_dirs": ["generated/test_logs"],
+              "output_dir": "generated/ai_summaries"
+            }
+          api-key: ${{ secrets.TT_CHAT_API_KEY }}
+          api-url: ${{ secrets.TT_CHAT_URL }}
+          job-name: "(Galaxy) DeepSeek Prefill - Kimi Cache Generation"
+      - uses: tenstorrent/tt-metal/.github/actions/upload-artifact-with-job-uuid@main
+        timeout-minutes: 10
+        if: ${{ !cancelled() }}
+        with:
+          prefix: "test_reports_"
+      - uses: tenstorrent/tt-metal/.github/actions/cleanup@main
+        if: always()
+
   ai-run-summary:
     name: "AI Run Summary"
     needs: [load-test-matrix, galaxy-deepseek-tests]

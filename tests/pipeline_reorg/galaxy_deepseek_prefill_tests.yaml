@@ -134,20 +134,14 @@
   # 10 iterations, no H2D service (nosvc). No-PCC: it drives the real chunked-prefill path end to end
   # (build once, forward 10x) and passes on completion -- no golden readback, no accuracy compare.
   #
-  # Paths (CI mounts only /mnt/MLPerf:ro):
-  #   KIMI_K2_6_HF_MODEL         -> dequantized Kimi HF checkpoint (config.json + safetensors.index.json)
-  #   TT_KIMI_PREFILL_TTNN_CACHE -> prebuilt 61-layer TTNN weight cache root (the test/conftest append
-  #                                 /kimi_k2_6_bh_32dev/8x4). Must be staged; the test asserts if the
-  #                                 cache is incomplete (no random-weight fallback, unlike Kimi Prefill
-  #                                 Block) -- getting this path wrong triggers a full HF weight download.
-  #   PREFILL_TRACE_DIR          -> longbook_qa_eng golden trace (same dataset the DeepSeek Transformer
-  #                                 stage uses via DEEPSEEK_V3_TRACE_DIR). Its metadata.json token_ids
-  #                                 feed the prefill; the no-PCC run reads tokens only (no golden compare).
+  # Paths (CI mounts /mnt/MLPerf:ro):
+  #   KIMI_K2_6_HF_MODEL  -> dequantized Kimi HF checkpoint (config.json + safetensors.index.json)
+  #   TT_KIMI_PREFILL_TTNN_CACHE is intentionally NOT set; the conftest falls back to
+  #     KIMI_K2_6_HF_MODEL/tensor_cache_bh_32dev/8x4  (written by the kimi_cache_gen job).
+  #   PREFILL_TRACE_DIR   -> longbook_qa_eng golden trace; metadata.json token_ids feed the prefill.
   cmd: |
     export MESH_DEVICE=TG
     export KIMI_K2_6_HF_MODEL=/mnt/MLPerf/huggingface/hub/Kimi-K2.6-dequantized
-    export TT_KIMI_PREFILL_TTNN_CACHE=/mnt/MLPerf/tt_dnn-models/moonshotai/Kimi-K2.6-Cache/CI
-    export TT_DS_PREFILL_TTNN_CACHE="$TT_KIMI_PREFILL_TTNN_CACHE"
     export PREFILL_TRACE_DIR=/mnt/MLPerf/deepseek-prefill-cache/golden/structured_traces/kimi_longbook_55k_vllm
     pytest "models/demos/deepseek_v3_d_p/tests/test_prefill_transformer_chunked.py::test_kimi_prefill_transformer_chunked_no_pcc[blackhole-kimi-mesh-8x4-L61-chunks5-ten_iters-nosvc]" -xvs
   test_type: kimi_chunked
@@ -155,6 +149,41 @@
   skus:
     bh_galaxy:
       timeout: 60
+  owner_id: U08RL15T4N8
+  team: models
+
+- name: "(Galaxy) DeepSeek Prefill - Kimi Cache Generation"
+  # One-time (idempotent) 61-layer TTNN weight cache generation for Kimi K2.6 on Galaxy.
+  # TT_KIMI_PREFILL_TTNN_CACHE is intentionally NOT set; the conftest writes the cache to:
+  #   KIMI_K2_6_HF_MODEL/tensor_cache_bh_32dev/8x4   (persistent on /mnt/MLPerf)
+  # This job requires /mnt/MLPerf mounted read-write.  It is routed to the dedicated
+  # kimi-generate-cache job in galaxy-deepseek-prefill-tests-impl.yaml which provides that
+  # mount; when run in the regular :ro matrix job it detects the read-only mount and exits
+  # cleanly.  When the cache is already complete the test loads from it and finishes in
+  # minutes; the 4h budget covers only the initial generation run.
+  cmd: |
+    export MESH_DEVICE=TG
+    export KIMI_K2_6_HF_MODEL=/mnt/MLPerf/huggingface/hub/Kimi-K2.6-dequantized
+    # Require a read-write /mnt/MLPerf mount; skip gracefully when running in the
+    # regular :ro matrix job (cache generation is handled by kimi-generate-cache job).
+    if [ ! -w /mnt/MLPerf ]; then
+      echo "::notice::/mnt/MLPerf is read-only; cache generation skipped (trigger via kimi-generate-cache impl job)"
+      exit 0
+    fi
+    # TT_KIMI_PREFILL_TTNN_CACHE intentionally NOT set; the conftest writes the 61-layer
+    # cache to ${KIMI_K2_6_HF_MODEL}/tensor_cache_bh_32dev (effective path appends /8x4).
+    # Running test_kimi_prefill_transformer (non-chunked) generates cache on first run and
+    # loads from it on subsequent runs without the 4-hour overhead.
+    pytest "models/demos/deepseek_v3_d_p/tests/test_prefill_transformer.py::test_kimi_prefill_transformer" \
+      -k "mesh-8x4 and 61_layers and e384_device and pretrained and random and 5k and iter1 and smoke and non_balanced and right_pad and no_determinism" \
+      -xvs
+    echo "::notice::Kimi TTNN cache written to: ${KIMI_K2_6_HF_MODEL}/tensor_cache_bh_32dev/8x4"
+    echo "For kimi_chunked verification, leave TT_KIMI_PREFILL_TTNN_CACHE unset (conftest auto-detects the path)."
+  test_type: kimi_cache_gen
+  test_group: module
+  skus:
+    bh_galaxy:
+      timeout: 240
   owner_id: U08RL15T4N8
   team: models
 
