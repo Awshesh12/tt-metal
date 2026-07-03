@@ -1041,13 +1041,27 @@ class Qwen36Model:
                 row = row[:, :buf_blocks]
             return row.contiguous()
 
+        import os
+
+        # QWEN_BATCHED_GDN_DEV_ASSEMBLE (default on): assemble each replay's B=1 GDN state into the
+        # batched decode buffer via device-side clones + concat instead of a to_torch snapshot +
+        # from_torch re-upload. For short prompts (bucket=128) the trace replay is tiny, so the
+        # per-user host round-trip (~B*48*(1+K) blocking mesh transfers) dominates TTFT and grows
+        # with B — the exact cost that hurts higher-batch short-prompt serving. Bit-identical (the
+        # to_torch(ConcatMesh,0)/from_torch(ShardMesh,0) round-trip is a mesh identity), so per-user
+        # coherence with DIFFERENT prompts is unchanged. Set =0 to force the legacy host path (A/B).
+        dev_assemble = os.environ.get("QWEN_BATCHED_GDN_DEV_ASSEMBLE", "1") != "0"
+
         # Per-user logits are read to HOST during the loop and re-uploaded at the end: each replay
         # overwrites the persistent trace output, and the post-loop assembly churns device memory.
         host_logits = []  # torch [1, 1, vocab] (one replica) per user
         # Collect each replay's B=1 GDN state to assemble into the batched decode buffer.
-        per_user_rec = []
-        per_user_conv = []
+        per_user_rec = []  # host path
+        per_user_conv = []  # host path
+        per_user_rec_dev = []  # device path: per user, list over GDN layers of CLONED rec_state
+        per_user_conv_dev = []  # device path: per user, list over GDN layers of [K-1 cloned conv slots]
         comp = ttnn.ConcatMeshToTensor(self.mesh_device, dim=0)
+        dn_states = [layer.attention for layer in self.layers if not layer.is_full_attention]
 
         for u in range(B):
             toks = token_ids_list[u]
@@ -1090,10 +1104,16 @@ class Qwen36Model:
             # conv_states in place and the next replay would overwrite them.
             ttnn.synchronize_device(self.device)
 
-            # Gather this replay's B=1 GDN state (host) for assembly after the loop.
-            dn_states = [layer.attention for layer in self.layers if not layer.is_full_attention]
-            per_user_rec.append([ttnn.to_torch(dn.rec_state, mesh_composer=comp) for dn in dn_states])
-            per_user_conv.append([[ttnn.to_torch(c, mesh_composer=comp) for c in dn.conv_states] for dn in dn_states])
+            # Gather this replay's B=1 GDN state for assembly after the loop. The next replay resets
+            # the scratch IN PLACE, so snapshot now — device-side clones (default) or host to_torch.
+            if dev_assemble:
+                per_user_rec_dev.append([ttnn.clone(dn.rec_state) for dn in dn_states])
+                per_user_conv_dev.append([[ttnn.clone(dn.conv_states[m]) for m in range(1, dn.K)] for dn in dn_states])
+            else:
+                per_user_rec.append([ttnn.to_torch(dn.rec_state, mesh_composer=comp) for dn in dn_states])
+                per_user_conv.append(
+                    [[ttnn.to_torch(c, mesh_composer=comp) for c in dn.conv_states] for dn in dn_states]
+                )
 
             # Logit at actual_len-1, read to HOST immediately (before the next replay overwrites
             # the trace output). Re-uploaded at the end.
@@ -1107,7 +1127,10 @@ class Qwen36Model:
         # then assemble the per-user states into row u in place (_stable_state path).
         self._restore_gdn_batched(self._gdn_batched_prev)
         self._gdn_batched_prev = None
-        self._assemble_per_user_gdn(per_user_rec, per_user_conv)
+        if dev_assemble:
+            self._assemble_per_user_gdn_dev(per_user_rec_dev, per_user_conv_dev)
+        else:
+            self._assemble_per_user_gdn(per_user_rec, per_user_conv)
 
         # Re-upload the per-user logits as stable device tensors after all allocations.
         return self._reupload_host_logits(host_logits)
@@ -1152,6 +1175,41 @@ class Qwen36Model:
                     )
                     for m in range(1, K)
                 ]
+                staging.extend(slots)
+                conv_carry_list.append(ttnn.concat(slots, dim=1) if K - 1 > 1 else ttnn.reshape(slots[0], (1, 1, D)))
+            # assemble_batched_state takes ownership of rec_list + conv_carry_list and deallocates
+            # them (gdn/tp.py); we only free the per-slot staging tensors it never sees.
+            dn.assemble_batched_state(rec_list, conv_carry_list)
+            for t in staging:
+                ttnn.deallocate(t)
+
+    def _assemble_per_user_gdn_dev(self, per_user_rec_dev, per_user_conv_dev):
+        """Device-side counterpart of _assemble_per_user_gdn: stitch B per-user B=1 GDN states —
+        already cloned onto the device, so NO host round-trip — into row u of the batched [B,...]
+        decode buffers via assemble_batched_state. Bit-identical to the host path: the host path's
+        to_torch(ConcatMeshToTensor,dim=0) -> from_torch(ShardTensorToMesh,dim=0) round-trip is an
+        identity on the mesh layout, so ttnn.clone + ttnn.concat(dim=0) produce the same per-device
+        tensors. Eliminates the ~B*48*(1+K) tiny blocking transfers each way (~60s at B=8, the
+        dominant batched-TTFT overhead). The batched GDN bindings MUST already be rebound (writes
+        happen in place under _stable_state).
+
+        per_user_rec_dev[u][li]:  cloned rec_state [1, Nv, Dk, Dv] for user u, GDN layer li.
+        per_user_conv_dev[u][li]: list of K-1 cloned conv slots (slots 1..K-1), each [1, 1, D]
+                                  (slot 0 is the zeroed shifted-out tap; the assembler re-zeros it).
+        """
+        B = len(per_user_rec_dev)
+        dn_layers = [layer.attention for layer in self.layers if not layer.is_full_attention]
+        for li, dn in enumerate(dn_layers):
+            D = dn.qkv_dim_tp
+            K = dn.K
+            # rec_list: user u's cloned recurrent state; assemble_batched_state concats along dim 0.
+            rec_list = [per_user_rec_dev[u][li] for u in range(B)]
+            # Rebuild the [1, K-1, D] conv carry each user expects from its cloned conv slots
+            # (concat along dim 1), mirroring _assemble_per_user_gdn exactly.
+            conv_carry_list = []
+            staging = []  # the per-slot clones concat consumes; free after assembly
+            for u in range(B):
+                slots = per_user_conv_dev[u][li]  # K-1 device clones, each [1, 1, D]
                 staging.extend(slots)
                 conv_carry_list.append(ttnn.concat(slots, dim=1) if K - 1 > 1 else ttnn.reshape(slots[0], (1, 1, D)))
             # assemble_batched_state takes ownership of rec_list + conv_carry_list and deallocates
@@ -1210,15 +1268,29 @@ class Qwen36Model:
         page_table_torch = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
         assert page_table_torch.shape[0] == B, "page_table must have one row per user"
 
+        import os
+
         comp = ttnn.ConcatMeshToTensor(self.mesh_device, dim=0)
         dn_layers = [layer.attention for layer in self.layers if not layer.is_full_attention]
+
+        # QWEN_BATCHED_GDN_DEV_ASSEMBLE (default on): after each user's prefill, snapshot its B=1
+        # GDN state via DEVICE-SIDE clones (survives the next user's in-place reset) and assemble
+        # into the batched decode buffer with concat — no host round-trip. The host path below
+        # does ~B*48*(1+K) tiny to_torch snapshots + as many from_torch re-uploads, each a
+        # blocking mesh transfer; that fixed per-user overhead (~60s at B=8) dominates batched
+        # TTFT and is independent of prompt length. Bit-identical (the to_torch(ConcatMesh,0)/
+        # from_torch(ShardMesh,0) round-trip is a mesh identity), so per-user coherence — with
+        # DIFFERENT prompts/lengths — is unchanged. Set =0 to force the legacy host path (A/B).
+        dev_assemble = os.environ.get("QWEN_BATCHED_GDN_DEV_ASSEMBLE", "1") != "0"
 
         # Swap every GDN layer to a B=1 scratch (per-user path is B=1); assembled into the batched
         # buffers after the loop. prev holds the batched bindings for restore.
         prev = self._alloc_gdn_scratch_b1()
         host_logits = []  # torch [1, 1, vocab] (one replica) per user
-        per_user_rec = []  # per user: list over GDN layers of host rec_state snapshots
-        per_user_conv = []  # per user: list over GDN layers of [list of K conv_states snapshots]
+        per_user_rec = []  # host path: per user, list over GDN layers of host rec_state snapshots
+        per_user_conv = []  # host path: per user, list over GDN layers of [list of K conv snapshots]
+        per_user_rec_dev = []  # device path: per user, list over GDN layers of CLONED rec_state
+        per_user_conv_dev = []  # device path: per user, list over GDN layers of [K-1 cloned conv slots]
         try:
             for u in range(B):
                 toks = token_ids_list[u]
@@ -1235,18 +1307,31 @@ class Qwen36Model:
                 host_logits.append(ttnn.to_torch(lg, mesh_composer=comp)[0:1].clone())  # [1,1,vocab] one replica
                 ttnn.deallocate(lg)
 
-                # Snapshot this user's B=1 GDN state (host) for assembly after the loop.
-                per_user_rec.append([ttnn.to_torch(dn.rec_state, mesh_composer=comp) for dn in dn_layers])
-                per_user_conv.append(
-                    [[ttnn.to_torch(c, mesh_composer=comp) for c in dn.conv_states] for dn in dn_layers]
-                )
+                # Snapshot this user's B=1 GDN state for assembly after the loop. The B=1 scratch is
+                # reset IN PLACE for the next user, so the snapshot must copy the state out first —
+                # device-side clones (default) or a host to_torch (legacy A/B). slot 0 of conv_states
+                # is the zeroed shifted-out tap; only slots 1..K-1 carry state.
+                if dev_assemble:
+                    per_user_rec_dev.append([ttnn.clone(dn.rec_state) for dn in dn_layers])
+                    per_user_conv_dev.append(
+                        [[ttnn.clone(dn.conv_states[m]) for m in range(1, dn.K)] for dn in dn_layers]
+                    )
+                else:
+                    per_user_rec.append([ttnn.to_torch(dn.rec_state, mesh_composer=comp) for dn in dn_layers])
+                    per_user_conv.append(
+                        [[ttnn.to_torch(c, mesh_composer=comp) for c in dn.conv_states] for dn in dn_layers]
+                    )
         finally:
-            # Restore the batched [B,...] GDN decode buffers and free the B=1 scratch.
+            # Restore the batched [B,...] GDN decode buffers and free the B=1 scratch. The clones
+            # are independent allocations, so freeing the scratch here does not touch them.
             self._restore_gdn_batched(prev)
 
         ttnn.synchronize_device(self.device)
         # Stitch the per-user states into row u of the (now-rebound) batched decode buffers.
-        self._assemble_per_user_gdn(per_user_rec, per_user_conv)
+        if dev_assemble:
+            self._assemble_per_user_gdn_dev(per_user_rec_dev, per_user_conv_dev)
+        else:
+            self._assemble_per_user_gdn(per_user_rec, per_user_conv)
         # Re-upload the per-user logits as stable device tensors (prefill_paged_peruser contract).
         return self._reupload_host_logits(host_logits)
 
@@ -2123,6 +2208,204 @@ class Qwen36Model:
             if not layer.is_full_attention:
                 layer.attention.finalize_pending()
         return logits
+
+    def _alloc_gdn_scratch_b(self, bg):
+        """Like _alloc_gdn_scratch_b1 but for a group of `bg` users: allocate a dedicated
+        [bg,...] GDN state on every GDN layer, distinct from the real batched [B,...] decode
+        buffer. Returns the prior batched bindings for _restore_gdn_batched. Used by the grouped
+        batched prefill (forward_prefill_batched writes [bg,...] into these in place)."""
+        prev = []
+        for layer in self.layers:
+            if layer.is_full_attention:
+                continue
+            dn = layer.attention
+            prev.append((dn, dn.B, dn.rec_state, dn.conv_states, dn.conv_carry, dn._zero_conv0, dn._stable_state))
+            dn.B = bg
+            dn.reset_state()  # builds rec_state [bg,Nv,Dk,Dv], conv_states[*] [1,bg,D], carry, zero0
+            dn._stable_state = True  # forward_prefill_batched writes state in place under this flag
+        return prev
+
+    def _assemble_groups_gdn_dev(self, group_rec_dev, group_conv_dev):
+        """Assemble per-GROUP GDN states (each already batched [bg,...] on device, from
+        forward_prefill_batched) into the full [B,...] batched decode buffers via device-side
+        concat — no host round-trip. rec: concat groups along dim 0 -> [B,Nv,Dk,Dv]; conv_states[m]:
+        concat groups along dim 1 -> [1,B,D]. The batched GDN bindings MUST already be rebound
+        (writes in place under _stable_state). Row u == user u because groups are contiguous
+        (group g = users [g*group_size : ...])."""
+        dn_layers = [layer.attention for layer in self.layers if not layer.is_full_attention]
+        ng = len(group_rec_dev)
+        for li, dn in enumerate(dn_layers):
+            rec_full = ttnn.concat([group_rec_dev[g][li] for g in range(ng)], dim=0)  # [B, Nv, Dk, Dv]
+            rec_src = rec_full if rec_full.dtype == dn.rec_state.dtype else ttnn.typecast(rec_full, dn.rec_state.dtype)
+            ttnn.copy(rec_src, dn.rec_state)
+            if rec_src is not rec_full:
+                ttnn.deallocate(rec_src)
+            ttnn.deallocate(rec_full)
+            for g in range(ng):
+                ttnn.deallocate(group_rec_dev[g][li])
+            for m in range(dn.K):
+                conv_full = ttnn.concat([group_conv_dev[g][li][m] for g in range(ng)], dim=1)  # [1, B, D]
+                ttnn.copy(conv_full, dn.conv_states[m])
+                ttnn.deallocate(conv_full)
+                for g in range(ng):
+                    ttnn.deallocate(group_conv_dev[g][li][m])
+
+    def prefill_paged_grouped(self, token_ids_list, page_table, valid_lens=None, group_size=4):
+        """Grouped batched SHORT-prompt prefill (single-pass, every valid_len <= one GDN bucket):
+        process users in groups of <= group_size through ONE hybrid forward per group instead of B
+        sequential B=1 forwards. Within a group the GDN layers run BATCHED (forward_prefill_batched,
+        per-row valid_len masking — bit-exact per user, see test_gdn_tp_batched_prefill) and the
+        full-attention layers run PER-USER (attention prefill is B=1 only). Groups of <=4 respect the
+        GDN kernel cap BH=B*Nv_tp<=32. Numerically the batched GDN + per-user attention is the same
+        math as prefill_paged_peruser, so per-user output (incl. DIFFERENT prompts/lengths) is
+        unchanged; it just amortizes the underutilized GDN over the group.
+
+        token_ids_list: list of B torch.Tensor [1, T_u] (lengths may differ).
+        page_table:      torch.Tensor [B, blocks_per_user] int32 (row u = user u's blocks).
+        valid_lens:      optional list of B ints; defaults to each T_u. Every valid_len MUST be <=
+                         the derived bucket (a single GDN chunk-set); callers route longer prompts
+                         to the chunked path.
+        Returns:         list of B ttnn logits [1, 1, vocab] (prefill_paged_peruser contract).
+        """
+        assert self.num_devices > 1, "prefill_paged_grouped is the TP (num_devices>1) path"
+        assert self._paged_kv_caches is not None, "Call allocate_kv_caches first"
+        B = len(token_ids_list)
+        pt_torch = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
+        assert pt_torch.shape[0] == B, "page_table must have one row per user"
+        vlens = list(valid_lens) if valid_lens is not None else [int(t.shape[1]) for t in token_ids_list]
+
+        gdn_chunk = self.args.gdn_chunk_size
+        block_size = get_block_size(self._paged_kv_caches)
+        # Common bucket for the group forward: round the longest prompt up to a GDN-chunk multiple.
+        bucket = max(gdn_chunk, ((max(vlens) + gdn_chunk - 1) // gdn_chunk) * gdn_chunk)
+        assert all(v <= bucket for v in vlens), "every valid_len must fit the single-pass bucket"
+
+        dn_layers = [layer.attention for layer in self.layers if not layer.is_full_attention]
+        rep = ttnn.ReplicateTensorToMesh(self.device)
+        # cos/sin for absolute positions [0, bucket) — shared by all users (single pass from pos 0).
+        cos_t, sin_t = self._rope_tp_cos_sin_torch(0, bucket)
+        cos = ttnn.from_torch(cos_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, mesh_mapper=rep)
+        sin = ttnn.from_torch(sin_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, mesh_mapper=rep)
+        csi = ttnn.from_torch(
+            torch.tensor([0], dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device
+        )
+
+        group_rec_dev, group_conv_dev = [], []
+        host_logits = [None] * B
+        comp = ttnn.ConcatMeshToTensor(self.mesh_device, dim=0)
+        for g0 in range(0, B, group_size):
+            grp = list(range(g0, min(g0 + group_size, B)))
+            Bg = len(grp)
+            prev = self._alloc_gdn_scratch_b(Bg)
+            try:
+                # Batched embedding: [1, Bg, bucket, dim] (pad each user's tokens to the bucket).
+                tok_bg = torch.zeros(Bg, bucket, dtype=torch.int32)
+                for i, u in enumerate(grp):
+                    t = token_ids_list[u][0, : vlens[u]].to(torch.int32)
+                    tok_bg[i, : t.shape[0]] = t
+                tok = ttnn.from_torch(tok_bg, dtype=ttnn.uint32, device=self.device, mesh_mapper=rep)
+                x = self.embd(tok)  # [Bg, bucket, d]
+                d = x.shape[-1]
+                # Canonical residual-stream shape [1, 1, Bg*bucket, d] (dim1==1) so the framework
+                # norm / MLP / residual add see the SAME layout as the validated per-user path
+                # (a [1,Bg,bucket,d] shape trips "invalid subtile broadcast" in the norm/residual).
+                # Reshaped to [Bg, bucket, d] only for the batched GDN, and split to [1,Bg,bucket,d]
+                # to slice each user for the per-user attention. Row order is user-major (user u owns
+                # rows [u*bucket : (u+1)*bucket]), matching the group state assembly.
+                x = ttnn.reshape(x, (1, 1, Bg * bucket, d))
+                x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(tok)
+                # Per-user device page tables (full + real-blocks-only for the KV fill).
+                full_pts, chunk_pts = [], []
+                for u in grp:
+                    row = pt_torch[u : u + 1].contiguous()
+                    full_pts.append(
+                        ttnn.from_torch(row, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+                    )
+                    blkN = num_blocks_in_seq(vlens[u], block_size)
+                    chunk_pts.append(
+                        ttnn.from_torch(
+                            row[:, :blkN].contiguous(),
+                            dtype=ttnn.int32,
+                            layout=ttnn.ROW_MAJOR_LAYOUT,
+                            device=self.device,
+                        )
+                    )
+
+                for layer in self.layers:
+                    # The DistributedNorm all-gathers to the FULL hidden dim for the module (dn), so
+                    # attn_in's last dim is the full dim (!= d, the fractured residual-stream dim).
+                    attn_in = layer.attention_norm(x, mode=Mode.PREFILL)  # [1, 1, Bg*bucket, full]
+                    full = attn_in.shape[-1]
+                    if layer.is_full_attention:
+                        attn_in_b = ttnn.reshape(attn_in, (1, Bg, bucket, full))  # split users for slicing
+                        outs = []
+                        for i, u in enumerate(grp):
+                            xi = ttnn.reshape(attn_in_b[:, i : i + 1, :, :], (1, 1, bucket, full))
+                            oi = layer.attention.forward_prefill_paged(
+                                xi,
+                                cos,
+                                sin,
+                                full_pts[i],
+                                chunk_page_table=chunk_pts[i],
+                                chunk_start_idx=0,
+                                chunk_start_idx_tensor=csi,
+                                user_id=0,  # per-user page tables are single-row; blocks route via values
+                            )
+                            ttnn.deallocate(xi)  # per-user slice copy
+                            outs.append(ttnn.reshape(oi, (1, 1, bucket, oi.shape[-1])))
+                        # Concat user outputs along the seq dim -> [1, 1, Bg*bucket, d_out] (user-major).
+                        attn_out = ttnn.concat(outs, dim=2) if Bg > 1 else outs[0]
+                        for o in outs:
+                            if o is not attn_out:
+                                ttnn.deallocate(o)
+                    else:
+                        # Batched GDN over the group (per-row valid_len masking, from scratch).
+                        gdn_in = ttnn.reshape(attn_in, (Bg, bucket, full))
+                        attn_out = layer.attention.forward_prefill_batched(
+                            gdn_in, chunk_size=gdn_chunk, valid_lens=[vlens[u] for u in grp], carry=False
+                        )  # [1, Bg, bucket, d_out]
+                        attn_out = ttnn.reshape(attn_out, (1, 1, Bg * bucket, attn_out.shape[-1]))
+                    ttnn.deallocate(attn_in)
+                    h = ttnn.add(x, attn_out)  # both [1, 1, Bg*bucket, d]
+                    ttnn.deallocate(x)
+                    ttnn.deallocate(attn_out)
+                    ff_in = layer.ffn_norm(h, mode=Mode.PREFILL)
+                    ff_out = layer.feed_forward.forward(ff_in)
+                    ttnn.deallocate(ff_in)
+                    x = ttnn.add(h, ff_out)
+                    ttnn.deallocate(h)
+                    ttnn.deallocate(ff_out)
+
+                # Final norm + per-user next-token logit at valid_len-1, read to host immediately.
+                xn = self.norm(x, mode=Mode.PREFILL)  # [1, 1, Bg*bucket, full]
+                ttnn.deallocate(x)
+                xn_b = ttnn.reshape(xn, (1, Bg, bucket, xn.shape[-1]))
+                for i, u in enumerate(grp):
+                    x_last = xn_b[:, i : i + 1, vlens[u] - 1 : vlens[u], :]  # [1,1,1,full] (slice copy)
+                    lg = ttnn.linear(x_last, self.lm_head_weight)
+                    ttnn.deallocate(x_last)
+                    host_logits[u] = (
+                        ttnn.to_torch(lg, mesh_composer=comp).reshape(1, 1, -1)[:, :, : self.args.vocab_size].clone()
+                    )
+                    ttnn.deallocate(lg)
+                ttnn.deallocate(xn)
+                for t in full_pts + chunk_pts:
+                    ttnn.deallocate(t)
+
+                # Clone the group's batched GDN state (survives the next group's scratch reset).
+                group_rec_dev.append([ttnn.clone(dn.rec_state) for dn in dn_layers])
+                group_conv_dev.append([[ttnn.clone(dn.conv_states[m]) for m in range(dn.K)] for dn in dn_layers])
+            finally:
+                self._restore_gdn_batched(prev)
+
+        ttnn.deallocate(cos)
+        ttnn.deallocate(sin)
+        ttnn.deallocate(csi)
+        ttnn.synchronize_device(self.device)
+        # Stitch the per-group states into the full [B,...] batched decode buffers (row u = user u).
+        self._assemble_groups_gdn_dev(group_rec_dev, group_conv_dev)
+        return self._reupload_host_logits(host_logits)
 
     def _fill_paged_cache_from_prefill(self, page_table):
         """Transfer concat-based K/V into paged cache after prefill.
