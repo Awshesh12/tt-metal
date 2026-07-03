@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/circular_buffer.h"
+#include "api/tensor/noc_traits.h"
+#include "api/core_local_mem.h"
 #include <algorithm>
 
 bool contains_element(uint32_t* arr, uint32_t size, uint32_t val) {
@@ -39,21 +43,26 @@ void kernel_main() {
 
     const auto s = TensorAccessor(dst_args, output_buffer_address);
 
+    Noc noc;
+    CircularBuffer cb_src(src_cb_id);
+    CircularBuffer cb_index(index_cb_id);
+    CircularBuffer cb_fill(fill_cb_id);
+
     // Performance optimization:
     // Prefill an input page (in L1) with fill_value
-    cb_reserve_back(fill_cb_id, onepage);
-    uint32_t fill_addr = get_write_ptr(fill_cb_id);
+    cb_fill.reserve_back(onepage);
+    uint32_t fill_addr = cb_fill.get_write_ptr();
     auto* fill_ptr = reinterpret_cast<volatile tt_l1_ptr IntType*>(fill_addr);
     if constexpr (!is_last_dim) {
         for (uint32_t i = 0; i < row_size; ++i) {
             fill_ptr[i] = fill_value;
         }
     }
-    cb_push_back(fill_cb_id, onepage);
+    cb_fill.push_back(onepage);
 
     // Wait for index tensor to be available
-    cb_wait_front(index_cb_id, onepage);
-    uint32_t index_addr = get_read_ptr(index_cb_id);
+    cb_index.wait_front(onepage);
+    uint32_t index_addr = cb_index.get_read_ptr();
     uint32_t* index_ptr = reinterpret_cast<uint32_t*>(index_addr);
 
     // Write input pages
@@ -67,13 +76,12 @@ void kernel_main() {
 
         if (use_filled_page) {
             // Write filled page to output tensor
-            uint64_t output_noc_addr = s.get_noc_addr(row_id);
-            noc_async_write(fill_addr, output_noc_addr, output_page_size);
-            noc_async_write_barrier();
+            noc.async_write(CoreLocalMem<uint32_t>(fill_addr), s, output_page_size, {}, {.page_id = row_id});
+            noc.async_write_barrier();
         } else {
             // Wait for input page from reader kernel
-            cb_wait_front(src_cb_id, onepage);
-            uint32_t input_addr = get_read_ptr(src_cb_id);
+            cb_src.wait_front(onepage);
+            uint32_t input_addr = cb_src.get_read_ptr();
 
             // If dim is the last dim, we need to fill in certain spots in the page
             if constexpr (is_last_dim) {
@@ -84,11 +92,10 @@ void kernel_main() {
             }
 
             // Write page to output tensor
-            uint64_t output_noc_addr = s.get_noc_addr(row_id);
-            noc_async_write(input_addr, output_noc_addr, output_page_size);
-            noc_async_write_barrier();
+            noc.async_write(CoreLocalMem<uint32_t>(input_addr), s, output_page_size, {}, {.page_id = row_id});
+            noc.async_write_barrier();
 
-            cb_pop_front(src_cb_id, onepage);
+            cb_src.pop_front(onepage);
         }
     }
 }
