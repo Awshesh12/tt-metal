@@ -1,18 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""TP validation for Qwen3.5/3.6 full attention on a Blackhole mesh.
+"""TP validation for Qwen3.5/3.6 full attention on Blackhole.
 
-One file per component (decode / prefill / paged-KV), all sharing the loaders and
-mesh parametrization from ``test_factory``:
-
-* ``test_attention_tp``         — decode PCC @ pos0 (attention over a single key
-  reduces to V, so an exact torch reference covers the q/gate split, V proj, GQA
-  mapping, sigmoid gate, output proj, sharding, reduce-scatter) + a second decode
-  step for shape/NaN.
-* ``test_attention_tp_prefill`` — causal GQA prefill over a short sequence (head
-  layout transpose/reshape, partial RoPE, causal SDPA, gate, row-parallel output).
-* ``test_attention_tp_paged``   — paged-KV path (vLLM contract) must match the
-  concat-KV oracle at both the prefill and decode steps.
+Tests (shared loaders/mesh from test_factory):
+* test_attention_tp         — decode PCC @ pos0 + pos1 shape/NaN
+* test_attention_tp_prefill — causal GQA prefill (S=64)
+* test_attention_tp_paged   — paged-KV vs concat-KV oracle (prefill + decode)
 
 Run:
     MESH_DEVICE=P150x4 HF_MODEL=Qwen/Qwen3.6-27B \
@@ -53,9 +46,7 @@ def _rope_torch(x, rope_dim, theta):  # x: [S, H, HD]
     return torch.cat([xr * cos + xrot * sin, xp], dim=-1)
 
 
-# B=1 excluded: the non-paged SDPA-decode path decorrelates only in the degenerate
-# B=1 + pos-0 case. B=1 decode uses the paged path (validated at PCC 1.0 by
-# test_attention_tp_paged); this sweep targets the batched feature (B in {8, 32}).
+# B=1 uses paged decode (test_attention_tp_paged); this sweep targets batched B in {8, 32}.
 @torch.no_grad()
 @parametrize_mesh_tp()
 @parametrize_batch(batches=(8, 32))
@@ -66,7 +57,6 @@ def test_attention_tp(mesh_device, B, reset_seeds, ensure_gc, request):
     li = next(i for i, t in enumerate(args.attention_type_list) if t == "full_attention")
     logger.info(f"devices={nd} full-attn layer={li} NH={args.n_local_heads} NKV={args.n_local_kv_heads}")
 
-    # args.CKPT_DIR is the resolved local snapshot dir (Qwen36ModelArgs downloads the hub id).
     sd = load_attn_layer(args.CKPT_DIR, li)
     from models.tt_transformers.tt.ccl import TT_CCL
 
@@ -87,7 +77,7 @@ def test_attention_tp(mesh_device, B, reset_seeds, ensure_gc, request):
     assert out_t.shape[-1] == args.dim, out_t.shape
     assert not torch.isnan(out_t).any() and out_t.abs().max() > 0
 
-    # torch reference @ pos0: attn_out[h] = V[h // group]; out = o_proj(gated)
+    # pos0 ref: attn_out[h] = V[h // group]; out = o_proj(gated)
     NH, NKV, HD = args.n_heads, args.n_kv_heads, args.head_dim
     grp = NH // NKV
     xf = x[0, 0].float()  # [B, dim]
@@ -102,7 +92,7 @@ def test_attention_tp(mesh_device, B, reset_seeds, ensure_gc, request):
     logger.info(f"ATTENTION TP PCC (pos0) = {pcc}")
     assert passing, f"attention TP PCC too low: {pcc}"
 
-    # second decode step @ pos1: real 2-key attention; shape/NaN only
+    # pos1: 2-key attention; shape/NaN only
     cur1 = torch.ones(B, dtype=torch.int32)
     cur1_tt = ttnn.from_torch(
         cur1, dtype=ttnn.int32, device=mesh_device, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device)
@@ -138,7 +128,7 @@ def test_attention_tp_prefill(mesh_device, reset_seeds, ensure_gc, request):
     out = attn.forward_prefill(x_tt, cos, sin)
     out_t = ttnn.to_torch(out, mesh_composer=tp_composer(mesh_device))[0, 0].float()
 
-    # ---- torch reference: causal GQA attention ----
+    # torch ref: causal GQA
     NH, NKV, HD = args.n_heads, args.n_kv_heads, args.head_dim
     grp, rd, scale = NH // NKV, args.rope_head_dim, HD**-0.5
     xf = x[0, 0].float()
@@ -217,13 +207,13 @@ def test_attention_tp_paged(mesh_device, reset_seeds, ensure_gc, request):
     )
     comp = tp_composer(mesh_device)
 
-    # ---- concat reference (the oracle) ----
+    # concat oracle
     a_ref = TPAttention(mesh_device, args, tw, tt_ccl)
     a_ref.reset_state()
     pre_ref = ttnn.to_torch(a_ref.forward_prefill(to_dev(xp), cos_p, sin_p), mesh_composer=comp).float()
     dec_ref = ttnn.to_torch(a_ref.forward_decode(to_dev(xd), cur_tt, cos_d, sin_d), mesh_composer=comp).float()
 
-    # ---- paged path ----
+    # paged path
     a_pag = TPAttention(mesh_device, args, tw, tt_ccl)
     a_pag.set_paged_kv_cache(mk_cache(), mk_cache())
     pre_pag = ttnn.to_torch(
@@ -251,24 +241,17 @@ def test_attention_tp_paged(mesh_device, reset_seeds, ensure_gc, request):
 @parametrize_mesh_tp()
 @parametrize_batch(batches=(8, 32))
 def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, request):
-    """Per-user batched paged decode (the serving contract).
-
-    B users are prefilled into their own blocks of one shared paged KV cache at
-    distinct lengths; a single batched decode with a per-user cur_pos must reproduce,
-    row-by-row, B independent B=1 paged decodes. Proves per-user page-table rows,
-    cur_pos, and paged_fill_cache batch_idx compose with no cross-user contamination.
-    """
+    """Per-user batched paged decode: B users in shared cache must match B independent B=1 runs."""
     os.environ.setdefault("HF_MODEL", model_path())
     args = Qwen36ModelArgs(mesh_device, max_batch_size=B, max_seq_len=256)
     nd = mesh_device.get_num_devices()
     li = next(i for i, t in enumerate(args.attention_type_list) if t == "full_attention")
     NKV, HD = args.n_local_kv_heads, args.head_dim
     rd, theta, max_seq = args.rope_head_dim, args.rope_theta, args.max_seq_len
-    block_size, bpu = 64, 4  # 4 blocks/user => up to 256 cached tokens
+    block_size, bpu = 64, 4  # 4 blocks/user, up to 256 cached tokens
     logger.info(f"devices={nd} layer={li} B={B} NKV_local={NKV} HD={HD} blocks/user={bpu}")
 
-    # forward_decode keys all shapes off self.B (== max_batch_size), so the B=1 reference
-    # needs its own max_batch_size=1 args (weights tw are batch-independent and shared).
+    # B=1 reference needs max_batch_size=1 (forward_decode keys shapes off self.B).
     args1 = Qwen36ModelArgs(mesh_device, max_batch_size=1, max_seq_len=256)
 
     sd = load_attn_layer(args.CKPT_DIR, li)
@@ -293,7 +276,7 @@ def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, requ
             torch.tensor(rows, dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh_device
         )
 
-    def cur_pt(positions):  # per-user int32 positions [B], replicated across the mesh
+    def cur_pt(positions):
         return ttnn.from_torch(
             torch.tensor(positions, dtype=torch.int32),
             dtype=ttnn.int32,
@@ -302,7 +285,7 @@ def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, requ
         )
 
     def prefill_user(attn, x_u, blocks):
-        """Prefill one B=1 sequence into the given physical blocks (model's B=1 contract)."""
+        """Prefill one B=1 sequence into given physical blocks."""
         L = x_u.shape[-2]
         cos_p, sin_p = rot_mats_prefill(mesh_device, rd, L, theta)
         pt = rm_pt([blocks])  # [1, bpu]
@@ -310,12 +293,11 @@ def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, requ
             replicate_to_device(mesh_device, x_u), cos_p, sin_p, pt, chunk_page_table=pt, chunk_start_idx=0, user_id=0
         )
 
-    # Distinct, tile-aligned prompt lengths per user (all < bpu*block_size and < max_seq).
     prompt_lens = [64 + 32 * (u % 6) for u in range(B)]  # {64,96,128,160,192,224}
     xp = [torch.randn(1, 1, prompt_lens[u], args.dim, dtype=torch.bfloat16) for u in range(B)]
     xd = [torch.randn(1, 1, 1, args.dim, dtype=torch.bfloat16) for u in range(B)]
 
-    # ---- reference: B independent B=1 paged runs (own fresh cache, blocks [0..bpu)) ----
+    # Reference: B independent B=1 paged runs.
     ref_rows = []
     for u in range(B):
         a = TPAttention(mesh_device, args1, tw, tt_ccl)
@@ -331,12 +313,12 @@ def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, requ
         ttnn.deallocate(k_c)
         ttnn.deallocate(v_c)
 
-    # ---- batched: all users in ONE shared cache; single batched decode step ----
+    # Batched: shared cache, single B-wide decode.
     a_b = TPAttention(mesh_device, args, tw, tt_ccl)
     a_b.set_paged_kv_cache(mk_cache(B * bpu), mk_cache(B * bpu))
     for u in range(B):
         prefill_user(a_b, xp[u], list(range(u * bpu, (u + 1) * bpu)))
-    x_dec = torch.cat(xd, dim=2)  # [1, 1, B, dim], row u = user u's decode token
+    x_dec = torch.cat(xd, dim=2)  # [1, 1, B, dim]
     cos_db, sin_db = rot_mats_decode(mesh_device, rd, max_seq, theta, torch.tensor(prompt_lens, dtype=torch.int32))
     page_table_b = rm_pt([list(range(u * bpu, (u + 1) * bpu)) for u in range(B)])  # [B, bpu]
     out_b = a_b.forward_decode(
@@ -344,10 +326,7 @@ def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, requ
     )
     out_t = ttnn.to_torch(out_b, mesh_composer=comp)  # [1, 1, B, dim]
 
-    # ---- per-row comparison (a flattened PCC would mask a single bad user) ----
-    # The SDPA-decode reduction tree differs between the B=1 reference and the B-wide path,
-    # so per-user PCC sits slightly below the single-run bar; threshold is relaxed accordingly
-    # in pcc_thresholds.json since this test targets per-user correctness, not bit-exactness.
+    # Per-row PCC (flattened would mask one bad user); relaxed threshold in pcc_thresholds.json.
     thr = get_pcc_threshold(request)
     pccs = [compute_pcc(ref_rows[u], out_t[0, 0, u].float()) for u in range(B)]
     worst = min(pccs)
@@ -360,28 +339,20 @@ def test_attention_tp_paged_peruser(mesh_device, B, reset_seeds, ensure_gc, requ
 @torch.no_grad()
 @parametrize_mesh_only()
 def test_attention_tp_qknorm_offset(mesh_device):
-    """Regression: load_attention_weights_tp must add +1 to q_norm/k_norm (the 64k-retrieval fix).
-
-    HF Qwen3_5RMSNorm computes output*(1+weight) and the checkpoints store the raw zero-centered
-    weights (means ~0.32-0.58), so the TP loader must add +1 to q_norm/k_norm. Without it, Q·K
-    logits are ~14x too small, long-context attention goes UNIFORM, and 64k retrieval collapses.
-    Builds a tiny synthetic state_dict and checks the loaded q_norm/k_norm equal raw weights + 1.
-    """
+    """Regression: load_attention_weights_tp must add +1 to q_norm/k_norm (HF stores zero-centered weights)."""
     from models.demos.blackhole.qwen36.tt.attention.tp import load_attention_weights_tp
 
     nd = mesh_device.get_num_devices()
     HD = 128
-    NH = 8 * nd  # arbitrary; sharded by dim=-1 across the mesh
+    NH = 8 * nd
     NKV = nd
     DIM = 1024
 
     torch.manual_seed(0)
-    # Distinctive q_norm/k_norm values centered well away from 0 (like the FP8 ckpt's ~0.75),
-    # so a stray +1 would be unmistakable.
     q_norm_w = torch.full((HD,), 0.75) + 0.01 * torch.randn(HD)
     k_norm_w = torch.full((HD,), 0.60) + 0.01 * torch.randn(HD)
     state_dict = {
-        "q_proj.weight": torch.randn(DIM, NH * HD * 2) * 0.02,  # fused [Q,gate], column-parallel
+        "q_proj.weight": torch.randn(DIM, NH * HD * 2) * 0.02,
         "k_proj.weight": torch.randn(DIM, NKV * HD) * 0.02,
         "v_proj.weight": torch.randn(DIM, NKV * HD) * 0.02,
         "o_proj.weight": torch.randn(NH * HD, DIM) * 0.02,
@@ -402,7 +373,6 @@ def test_attention_tp_qknorm_offset(mesh_device):
 
     tw = load_attention_weights_tp(mesh_device, state_dict, _Args(), cache_dir=None)
 
-    # Gather a single replica and compare against the RAW input (no +1).
     comp = ttnn.ConcatMeshToTensor(mesh_device, dim=0) if nd > 1 else None
     q_loaded = ttnn.to_torch(tw["q_norm"], mesh_composer=comp).float().reshape(-1)[:HD]
     k_loaded = ttnn.to_torch(tw["k_norm"], mesh_composer=comp).float().reshape(-1)[:HD]
@@ -413,7 +383,7 @@ def test_attention_tp_qknorm_offset(mesh_device):
     logger.info(f"q_norm: |loaded-raw|={q_err_raw:.4f}  |loaded-(raw+1)|={q_err_plus1:.4f}")
     logger.info(f"k_norm: |loaded-raw|={k_err_raw:.4f}")
 
-    # bf16 round-trip tolerance ~0.01; a stray +1 would be ~1.0 off.
+    # bf16 tolerance ~0.01; missing +1 would be ~1.0 off.
     assert (
         q_err_raw > 0.5
     ), f"q_norm must load WITH +1 (uniform-attention fix), but |loaded-raw|={q_err_raw:.4f} (regressed +1?)"

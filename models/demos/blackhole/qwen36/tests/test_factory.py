@@ -1,21 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared test helpers for the Qwen3.5/Qwen3.6 demo test suite.
+"""Shared helpers for Qwen3.5/3.6 demo tests.
 
-Centralizes what used to be copy-pasted across the per-test files:
-
-* ``model_path()``                 — resolve the HF model id/dir from ``HF_MODEL``
-* ``load_attn_layer`` / ``load_gdn_layer`` / ``load_mlp_layer``
-                                     — dequantize one layer's weights from the
-                                       FP8 (or bf16) safetensors checkpoint
-* ``compute_pcc`` / ``compare_tensors`` — single PCC implementation
-* ``get_pcc_threshold(request)``   — per-test threshold from ``pcc_thresholds.json``
-* ``parametrize_mesh_tp()``        — the env-driven (1,4)/(1,1) mesh + FABRIC_1D idiom
-* ``tp_composer`` / ``replicate_to_device`` — shared TP tensor helpers
-
-Heavy imports (ttnn weight loaders, ``Qwen36ModelArgs``) are kept lazy / local so
-pure-CPU tests (``test_weight_mapping``, ``test_substate``) stay fast at collection.
+Provides model_path, layer weight loaders, PCC helpers/thresholds, mesh parametrization,
+and TP tensor helpers. Heavy imports stay lazy so CPU-only tests collect fast.
 """
 
 import json
@@ -28,30 +17,23 @@ import torch
 
 import ttnn
 
-# TP tests default to the 27B variant; single-device unit tests setdefault 9B.
+# TP tests default 27B; single-device tests setdefault 9B.
 _DEFAULT_HF_MODEL = "Qwen/Qwen3.6-27B"
 _PCC_THRESHOLDS_PATH = os.path.join(os.path.dirname(__file__), "pcc_thresholds.json")
 
-# Prefill length buckets gated by --max-prefill (see conftest). Lengths above the
-# cap are auto-skipped so the routine loop stays fast.
+# Prefill buckets gated by --max-prefill (conftest); lengths above cap are skipped.
 PREFILL_BUCKETS = [128, 1024, 2048]
 
 
 def model_path():
-    """Resolve the HF model id/dir. Replaces the per-file ``_mp()``/``_model_path()``."""
+    """Resolve HF model id/dir from HF_MODEL."""
     return os.path.expanduser(os.environ.get("HF_MODEL", _DEFAULT_HF_MODEL))
 
 
-# --------------------------------------------------------------------------- #
-# Checkpoint weight loaders (FP8-block dequant)
-# --------------------------------------------------------------------------- #
 def load_layer_weights(ckpt_dir, layer_idx, names, search_prefix, out_prefix=""):
-    """Dequantize selected ``layers.<i>.<search_prefix><name>`` weights into a dict.
+    """Dequantize selected layers.<i>.<search_prefix><name> weights into a dict.
 
-    ``names`` entries are leaf names, or ``(name, has_weight_suffix)`` tuples for
-    params stored without a ``.weight`` suffix (GDN's ``A_log``/``dt_bias``).
-    Output keys are ``<out_prefix><name>[.weight]`` — matching exactly what the
-    original ``_load_*`` helpers produced.
+    ``names`` may be leaf names or (name, has_weight_suffix) tuples (e.g. A_log, dt_bias).
     """
     from safetensors import safe_open
 
@@ -77,7 +59,7 @@ def load_layer_weights(ckpt_dir, layer_idx, names, search_prefix, out_prefix="")
 
 
 def load_attn_layer(ckpt_dir, layer_idx):
-    """Full-attention layer weights — keys ``q_proj.weight`` … ``k_norm.weight``."""
+    """Full-attention layer weights (q/k/v/o proj + q/k norm)."""
     return load_layer_weights(
         ckpt_dir,
         layer_idx,
@@ -87,7 +69,7 @@ def load_attn_layer(ckpt_dir, layer_idx):
 
 
 def load_gdn_layer(ckpt_dir, layer_idx):
-    """Gated-DeltaNet layer weights — keys ``linear_attn.in_proj_qkv.weight`` …"""
+    """Gated-DeltaNet layer weights (linear_attn.*)."""
     return load_layer_weights(
         ckpt_dir,
         layer_idx,
@@ -108,7 +90,7 @@ def load_gdn_layer(ckpt_dir, layer_idx):
 
 
 def load_mlp_layer(ckpt_dir, layer_idx):
-    """SwiGLU MLP layer weights — keys ``gate_proj.weight``/``up_proj.weight``/``down_proj.weight``."""
+    """SwiGLU MLP weights (gate/up/down proj)."""
     return load_layer_weights(
         ckpt_dir,
         layer_idx,
@@ -117,11 +99,8 @@ def load_mlp_layer(ckpt_dir, layer_idx):
     )
 
 
-# --------------------------------------------------------------------------- #
-# PCC helpers
-# --------------------------------------------------------------------------- #
 def compute_pcc(a, b):
-    """Pearson correlation between two tensors (single canonical implementation)."""
+    """Pearson correlation between two tensors."""
     a_flat = a.float().flatten()
     b_flat = b.float().flatten()
     a_c = a_flat - a_flat.mean()
@@ -130,7 +109,7 @@ def compute_pcc(a, b):
 
 
 def compare_tensors(tt_tensor, torch_tensor, pcc_threshold=0.99):
-    """Compare a TT/torch tensor against a torch reference; logs and returns (passing, pcc)."""
+    """Compare TT/torch tensor to reference; returns (passing, pcc)."""
     from loguru import logger
 
     from models.common.utility_functions import comp_pcc
@@ -148,22 +127,12 @@ def _load_pcc_thresholds():
 
 
 def get_pcc_threshold(request, default=0.99):
-    """Per-test PCC threshold from ``pcc_thresholds.json``.
-
-    The table is a flat ``{test_function_name: threshold}`` map — qwen's test
-    names are unique across the 9B (single-device) and 27B (TP) suites, so a
-    single function-keyed table is unambiguous and, unlike a model-keyed lookup,
-    is robust to ``HF_MODEL`` being a resolved local snapshot path (whose basename
-    is an opaque hash, not "Qwen3.5-9B"). Unlisted tests fall back to ``default``.
-    """
+    """Per-test threshold from pcc_thresholds.json (keyed by function name). Unlisted tests use default."""
     table = _load_pcc_thresholds()
     func = getattr(request.node, "originalname", None) or request.node.name.split("[")[0]
     return table.get(func, default)
 
 
-# --------------------------------------------------------------------------- #
-# Mesh / device helpers
-# --------------------------------------------------------------------------- #
 def _resolve_mesh_shape(max_tp=4):
     return {"P150": (1, 1), "P150x4": (1, 4)}.get(
         os.environ.get("MESH_DEVICE"), (1, min(len(ttnn.get_device_ids()), max_tp))
@@ -171,13 +140,7 @@ def _resolve_mesh_shape(max_tp=4):
 
 
 def parametrize_mesh_tp(max_tp=4):
-    """Parametrize a TP test over the env-selected mesh shape + FABRIC_1D.
-
-    Mirrors the idiom the qwen TP tests used inline: ``MESH_DEVICE=P150`` -> (1,1),
-    ``P150x4`` -> (1,4); otherwise (1, min(num_devices, max_tp)). The mesh shape
-    gets an explicit ``RxC`` id so node names (and ``pcc_thresholds.json`` mesh
-    keys) are readable.
-    """
+    """Parametrize TP test over env-selected mesh + FABRIC_1D (P150→(1,1), P150x4→(1,4))."""
     shape = _resolve_mesh_shape(max_tp)
 
     def decorator(fn):
@@ -193,22 +156,12 @@ def parametrize_mesh_tp(max_tp=4):
 
 
 def parametrize_batch(batches=(1, 8, 32)):
-    """Parametrize a decode test over batch sizes (the ``B`` fixture argument).
-
-    B must be a power of two <= 32 so the ``kv_update_shard_cfg`` core grid in
-    ``Qwen35ModelArgs._init_tp_config`` factors cleanly (one user per core, grid
-    sized to ``max_batch_size``). Ids are ``B1``/``B8``/``B32`` so node names and
-    ``pcc_thresholds.json`` stay readable.
-    """
+    """Parametrize decode test over batch sizes B (power-of-two <= 32)."""
     return pytest.mark.parametrize("B", [pytest.param(b, id=f"B{b}") for b in batches])
 
 
 def parametrize_mesh_only(max_tp=4):
-    """Parametrize over just the env-selected mesh shape (no device_params / fabric).
-
-    For mesh tests that don't run fabric CCL ops (e.g. pure weight-loading checks),
-    matching the bare ``@parametrize("mesh_device", ...)`` decorator they used inline.
-    """
+    """Parametrize over mesh shape only (no FABRIC_1D); for non-CCL tests."""
     shape = _resolve_mesh_shape(max_tp)
 
     def decorator(fn):
@@ -220,13 +173,13 @@ def parametrize_mesh_only(max_tp=4):
 
 
 def tp_composer(mesh_device):
-    """ConcatMeshToTensor composer for TP outputs (dim=3 multi-device, dim=0 single)."""
+    """ConcatMeshToTensor for TP outputs (dim=3 multi-device, dim=0 single)."""
     nd = mesh_device.get_num_devices()
     return ttnn.ConcatMeshToTensor(mesh_device, dim=3 if nd > 1 else 0)
 
 
 def replicate_to_device(mesh_device, t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
-    """Replicate a torch tensor to every device in the mesh (TILE/DRAM by default)."""
+    """Replicate torch tensor to all mesh devices."""
     return ttnn.from_torch(
         t,
         dtype=dtype,

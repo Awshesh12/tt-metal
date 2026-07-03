@@ -1,10 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Hybrid TransformerBlock for Qwen3.5-9B.
-
-Dispatches to either Gated DeltaNet (linear attention) or Gated Full Attention
-based on the layer index. Both share the same RMSNorm + residual pattern and MLP.
-"""
+"""Hybrid TransformerBlock for Qwen3.5-9B: GDN or full attention + shared RMSNorm/MLP."""
 import ttnn
 from models.common.rmsnorm import RMSNorm
 from models.demos.blackhole.qwen36.tt.attention import AttentionConfig, Qwen36GatedAttention
@@ -15,11 +11,7 @@ from models.tt_transformers.tt.common import Mode
 
 
 class Qwen36DecoderLayer:
-    """Single transformer layer with hybrid attention dispatch.
-
-    Pattern: x → attention_norm → attention → residual → ff_norm → MLP → residual
-    Attention is either GatedAttention (full, with RoPE) or GatedDeltaNet (linear).
-    """
+    """One layer: norm → attention (full or GDN) → residual → norm → MLP → residual."""
 
     def __init__(self, mesh_device, args, state_dict, layer_num, tensor_cache_path=None, tt_ccl=None):
         self.layer_num = layer_num
@@ -31,16 +23,7 @@ class Qwen36DecoderLayer:
 
         prefix = f"layers.{layer_num}"
 
-        # Zero-centered RMSNorm (Qwen3.5): output = x_normed * (1 + weight). The
-        # framework RMSNorm applies the +1 internally via add_unit_offset=True and
-        # is mesh-aware (replicates the weight across a MeshDevice).
-        #
-        # Single device: plain RMSNorm on the full hidden state (validated path).
-        # TP (27B on a (1,4) mesh): the residual stream is fractured along the
-        # hidden dim, so each norm is wrapped in the framework DistributedNorm,
-        # which all-gathers (PREFILL: distributed rmsnorm + gather; DECODE:
-        # gather-then-norm) to hand the modules a replicated full-dim input —
-        # exactly as models/demos/qwen35_27b does via the framework decoder.
+        # Qwen3.5 zero-centered RMSNorm (1+weight). TP wraps in DistributedNorm (fractured→replicated).
         self.attention_norm = self._make_norm(
             mesh_device, args, state_dict, layer_num, "input_layernorm", tensor_cache_path, tt_ccl, "attention_norm"
         )
@@ -49,9 +32,7 @@ class Qwen36DecoderLayer:
         )
 
         if self.num_devices > 1:
-            # Tensor-parallel modules (sharded weights from the raw substate).
-            # Cache the sharded mesh weights to disk so re-runs skip the (slow,
-            # single-threaded) reorder+shard of the full 27B.
+            # TP modules with disk-cached sharded weights.
             tp_cache = (tensor_cache_path / f"layers.{layer_num}" / "tp") if tensor_cache_path else None
             if self.is_full_attention:
                 from models.demos.blackhole.qwen36.tt.attention.tp import TPAttention, load_attention_weights_tp
@@ -81,12 +62,7 @@ class Qwen36DecoderLayer:
         self.feed_forward = Qwen36MLP(mesh_device, mlp_state, mlp_cache, args=args, tt_ccl=tt_ccl)
 
     def _make_norm(self, mesh_device, args, state_dict, layer_num, weight_key, tensor_cache_path, tt_ccl, ag_key):
-        """Build the per-layer RMSNorm; wrap in DistributedNorm when TP>1.
-
-        On a single device this returns the same plain RMSNorm the validated 9B
-        path used. The DistributedNorm wrapper (TP>1) mirrors tt_transformers
-        decoder.py and handles the fractured->replicated transition.
-        """
+        """RMSNorm; DistributedNorm wrapper when TP>1."""
         norm = RMSNorm(
             device=mesh_device,
             dim=args.dim,
@@ -115,7 +91,7 @@ class Qwen36DecoderLayer:
         cos=None,
         sin=None,
         mode="decode",
-        chunk_size=128,  # = GDN long_prefill_chunk_size; the only size the chunk-seq prefill kernel supports
+        chunk_size=128,  # GDN chunk-seq kernel chunk size
         position_tensor=None,
         page_table=None,
         chunk_page_table=None,
@@ -126,24 +102,19 @@ class Qwen36DecoderLayer:
     ):
         _norm_mode = Mode.PREFILL if mode == "prefill" else Mode.DECODE
         if self.num_devices > 1:
-            # TP: DistributedNorm uses the framework's per-norm memory configs.
             _attn_norm_config = self.args.get_norm_config("attn", _norm_mode)
             _ff_norm_config = self.args.get_norm_config("ff", _norm_mode)
         else:
-            # In decode the norm output stays in L1 (as the old rms_norm_ttnn(memory_config=L1) did);
-            # in prefill the framework RMSNorm returns interleaved DRAM (matches the old None default).
+            # Decode: norm output in L1; prefill: interleaved DRAM.
             _attn_norm_config = _ff_norm_config = (
                 {"output_mem_config": ttnn.L1_MEMORY_CONFIG} if mode == "decode" else None
             )
         attn_input = self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
 
         if self.num_devices > 1:
-            # TP modules: input is the gathered (full-dim) norm output [1,1,B/S,dim];
-            # output is fractured along dim=3. cos/sin are in rope_tp format.
+            # TP: gathered norm input; fractured output. cos/sin in rope_tp format.
             if self.is_full_attention:
                 if mode == "prefill":
-                    # Contract/vLLM path supplies a page_table → paged KV prefill; the
-                    # demo path (no page_table) uses the internal concat caches.
                     if page_table is not None:
                         attn_output = self.attention.forward_prefill_paged(
                             attn_input,
@@ -161,12 +132,9 @@ class Qwen36DecoderLayer:
                         attn_input, position_tensor, cos, sin, page_table=page_table
                     )
             else:
-                # GDN carries its recurrent/conv state internally (capture_state on
-                # prefill, read on decode); it has no paged KV, so page_table is N/A.
+                # GDN: internal recurrent/conv state; no paged KV.
                 if mode == "prefill":
                     if gdn_collect:
-                        # Batched per-user prefill: stash this user's from-scratch state for
-                        # assembly into row u of the batched buffers (finalize_pending later).
                         attn_output = self.attention.forward_prefill_collect(
                             attn_input, chunk_size=chunk_size, valid_len=valid_len
                         )
