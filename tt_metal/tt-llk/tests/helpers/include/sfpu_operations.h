@@ -31,6 +31,7 @@
 #include "llk_sfpu/ckernel_sfpu_sqrt.h"
 #include "llk_sfpu/ckernel_sfpu_square.h"
 #include "llk_sfpu/ckernel_sfpu_tanh.h"
+#include "llk_sfpu/ckernel_sfpu_tanhshrink.h"
 #include "llk_sfpu/ckernel_sfpu_trigonometry.h"
 #include "llk_sfpu/ckernel_sfpu_typecast.h"
 #include "sfpu/ckernel_sfpu_abs.h"
@@ -38,6 +39,7 @@
 #include "sfpu/ckernel_sfpu_log.h"
 #include "sfpu/ckernel_sfpu_negative.h"
 #include "sfpu/ckernel_sfpu_relu.h"
+#include "sfpu/ckernel_sfpu_rounding_ops.h"
 #include "sfpu/ckernel_sfpu_silu.h"
 #include "sfpu/ckernel_sfpu_threshold.h"
 
@@ -224,12 +226,14 @@ void call_unary_typecast_operation(std::uint32_t dst_index)
     }
     else if constexpr (IN == DataFormat::UInt16 && OUT == DataFormat::UInt32)
     {
-        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_typecast_uint16_to_uint32, (APPROX_MODE, ITERATIONS, DST_ACCUM_MODE), dst_index, VectorMode::RC);
+        SFPU_UNARY_CALL(
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_typecast_uint16_to_uint32, (APPROX_MODE, ITERATIONS, DST_ACCUM_MODE), dst_index, VectorMode::RC);
     }
     else if constexpr (IN == DataFormat::UInt16 && OUT == DataFormat::Int32)
     {
         // Calls same kernel as the UInt32 case.
-        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_typecast_uint16_to_uint32, (APPROX_MODE, ITERATIONS, DST_ACCUM_MODE), dst_index, VectorMode::RC);
+        SFPU_UNARY_CALL(
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_typecast_uint16_to_uint32, (APPROX_MODE, ITERATIONS, DST_ACCUM_MODE), dst_index, VectorMode::RC);
     }
     else if constexpr (IN == DataFormat::UInt32 && OUT == DataFormat::UInt16)
     {
@@ -375,6 +379,10 @@ void call_unary_sfpu_operation_init()
     else if constexpr (OPERATION == SfpuType::tanh)
     {
         llk_math_eltwise_unary_sfpu_init<OPERATION>(tanh_init<APPROX_MODE, is_fp32_dest_acc_en>);
+    }
+    else if constexpr (OPERATION == SfpuType::tanhshrink)
+    {
+        llk_math_eltwise_unary_sfpu_init<OPERATION>(sfpu::tanhshrink_init<APPROX_MODE, is_fp32_dest_acc_en>);
     }
     else if constexpr (OPERATION == SfpuType::typecast)
     {
@@ -595,6 +603,26 @@ void call_unary_sfpu_operation(std::uint32_t dst_index, std::uint32_t math_forma
     else if constexpr (OPERATION == SfpuType::silu)
     {
         SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_silu_, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
+    }
+    else if constexpr (OPERATION == SfpuType::tanhshrink)
+    {
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_tanhshrink, (is_fp32_dest_acc_en, ITERATIONS), dst_index, vector_mode);
+    }
+    else if constexpr (OPERATION == SfpuType::floor)
+    {
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_floor_, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
+    }
+    else if constexpr (OPERATION == SfpuType::ceil)
+    {
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_ceil_, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
+    }
+    else if constexpr (OPERATION == SfpuType::trunc)
+    {
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_trunc_, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
+    }
+    else if constexpr (OPERATION == SfpuType::frac)
+    {
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_frac_, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
     }
     else if constexpr (OPERATION == SfpuType::sine)
     {
