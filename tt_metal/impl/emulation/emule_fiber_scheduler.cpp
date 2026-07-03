@@ -32,6 +32,15 @@
 extern thread_local uint8_t my_x[2];
 extern thread_local uint8_t my_y[2];
 
+// Object-Intent (ASAN) per-fiber resolved-range log pointers. Defined in
+// emulated_program_runner.cpp, declared in jit_hw/asan/asan_l1_checks.h. They point at
+// a buffer on the owning fiber's stack, so — unlike the program-uniform range
+// thread-locals — they must be restored per swap-in from the fiber ctx; otherwise a
+// fiber that parks would resume recording into a peer fiber's log. See tt-emule #241.
+extern thread_local uint64_t* __emule_l1_resolved_ranges;
+extern thread_local uint32_t* __emule_l1_resolved_ranges_count;
+extern thread_local uint32_t __emule_l1_resolved_ranges_capacity;
+
 namespace tt::tt_metal::emule_fiber {
 
 namespace {
@@ -147,6 +156,13 @@ void FiberSchedulerImpl::install_fiber(Fiber* f) {
     __emule_self = f->owned_ctx.get();       // the single thread_local repoint
     my_x[0] = my_x[1] = f->id.phys_x;        // restore the silicon-named coords
     my_y[0] = my_y[1] = f->id.phys_y;
+    // Object-Intent resolved-range log is per-fiber (a buffer on this fiber's stack);
+    // restore it so a parked OI fiber keeps recording into its own log after a peer ran
+    // on this worker. nullptr for non-OI fibers, which correctly disables recording and
+    // clears any predecessor's stale pointer. See tt-emule #241.
+    __emule_l1_resolved_ranges = f->owned_ctx->san_resolved_log;
+    __emule_l1_resolved_ranges_count = f->owned_ctx->san_resolved_count;
+    __emule_l1_resolved_ranges_capacity = f->owned_ctx->san_resolved_cap;
 }
 
 void FiberSchedulerImpl::worker_main(unsigned w) {
